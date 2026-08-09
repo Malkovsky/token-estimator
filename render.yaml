@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: agentic-token-estimator
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: TOKEN_ESTIMATOR_PROXY_MODE
+        value: render
+      - key: TOKEN_ESTIMATOR_QUOTAS_ENABLED
+        value: "true"
+      - key: TOKEN_ESTIMATOR_ALLOWED_ORIGINS
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TOKEN_ESTIMATOR_ANTHROPIC_MODELS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TOKEN_ESTIMATOR_GEMINI_MODELS
+        sync: false
+      - key: TURNSTILE_SITE_KEY
+        sync: false
+      - key: TURNSTILE_SECRET_KEY
+        sync: false
+      - key: TURNSTILE_EXPECTED_HOSTNAME
+        sync: false
