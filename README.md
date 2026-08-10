@@ -1,6 +1,6 @@
 # Agentic Token Estimator
 
-Estimate how many tokens an agentic harness can discover in a public GitHub repository.
+Count tokens across skills, instructions, prompts, agents, and MCP configuration in a public GitHub repository.
 
 Paste a repository or folder URL to inventory its skills, instructions, rules, prompts, agents, and MCP configuration. The report shows baseline token counts for every discovered artifact and can be shared as an immutable commit URL.
 
@@ -50,6 +50,17 @@ https://github.com/owner/repository/tree/main/path/to/skills
 ```
 
 You can also enter the repository and subdirectory separately under **Advanced options**. Folder reports use the same commit-level analysis as the full repository, so moving between folders does not download and scan the repository again while the report is cached.
+
+### Add a token badge to a README
+
+Repository reports show separate metadata and total-token badges with a copy button next to each. Paste the resulting Markdown into a README:
+
+```markdown
+[![Metadata tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=metadata)](https://agentic-token-estimator.onrender.com/)
+[![Total tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=total)](https://agentic-token-estimator.onrender.com/)
+```
+
+Badge URLs follow the repository's default branch unless `ref` is supplied. They also accept the same optional `path` and `encoding` query parameters as repository analysis. The report action pins `ref` to the analyzed commit so its badge remains consistent with the linked report.
 
 ### Choose a tokenizer
 
@@ -139,6 +150,7 @@ The repository scanner recognizes common conventions for Codex, Claude Code, Gem
 - `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` instruction files;
 - `.claude/rules`, `.cursor/rules`, and `.github/instructions` rules;
 - Claude, Cursor, Gemini, and GitHub Copilot commands, prompts, and agents;
+- manifest-declared source-agent catalogs such as Agency Agents divisions;
 - `.agents/skills`, `.claude/skills`, `.gemini/skills`, and other skill directories containing `SKILL.md`;
 - `.codex/config.toml`, `.mcp.json`, and supported harness-specific MCP configuration.
 

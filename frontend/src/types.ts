@@ -15,6 +15,7 @@ export type RepositoryReport = {
   api_version: "v1"; mode: "repository";
   repository: { provider: "github"; owner: string; name: string; commit_sha: string; html_url: string; subdirectory: string | null };
   method: MethodInfo; analyzer_version: string; inventory: InventoryItem[];
+  metadata_tokens: number;
   category_totals: Record<string, number>;
   warnings: { code: string; message: string; path: string | null; count: number }[];
   scan: { archive_members: number; relevant_files: number; relevant_bytes: number };

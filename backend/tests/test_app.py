@@ -8,6 +8,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
+from token_estimator_web.badges import compact_tokens, token_badge_svg
 from token_estimator_web.config import Settings
 from token_estimator_web.main import app, repositories
 from token_estimator_web.providers import NativeCountManager
@@ -15,6 +16,7 @@ from token_estimator_web.errors import ServiceProblem
 from token_estimator_web.repository import GitHubGateway, RepositoryManager, analyze_archive, parse_repository
 from token_estimator_web.schemas import (
     NativeCountRequest, NativeSnapshot, RepositoryIdentity, RepositoryResolveRequest,
+    RepositoryResolveResponse,
 )
 
 
@@ -67,6 +69,17 @@ def test_health_capabilities_and_legacy_context() -> None:
     )
     assert response.status_code == 200, response.text
     assert response.json()["records"][0]["tokens"] > 0
+
+
+def test_token_badge_formatting() -> None:
+    assert compact_tokens(999) == "999"
+    assert compact_tokens(1_250) == "1.2k"
+    assert compact_tokens(572_949) == "573k"
+    assert compact_tokens(1_250_000) == "1.2M"
+    svg = token_badge_svg(572_949, "total tokens")
+    assert 'aria-label="total tokens: 573k"' in svg
+    assert "#145eb5" in svg
+    assert "unavailable" in token_badge_svg(label="metadata tokens")
 
 
 def test_legacy_skill_mcp_and_scenario() -> None:
@@ -136,6 +149,34 @@ def test_resolve_creates_commit_canonical_path_and_rejects_private(monkeypatch: 
         asyncio.run(gateway.resolve(RepositoryResolveRequest(repository="acme/private"), settings))
 
 
+def test_repository_resolution_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = replace(Settings.from_env(), quotas_enabled=False)
+    manager = RepositoryManager(settings)
+    calls = 0
+
+    async def fake_resolve(
+        request: RepositoryResolveRequest, _: Settings,
+    ) -> RepositoryResolveResponse:
+        nonlocal calls
+        calls += 1
+        sha = "3" * 40
+        return RepositoryResolveResponse(
+            repository=RepositoryIdentity(
+                owner="acme", name="cached", commit_sha=sha,
+                html_url=f"https://github.com/acme/cached/tree/{sha}",
+            ),
+            requested_ref=request.ref or "main",
+            canonical_path=f"/github/acme/cached/commit/{sha}?encoding=o200k_base",
+        )
+
+    monkeypatch.setattr(manager.gateway, "resolve", fake_resolve)
+    target = RepositoryResolveRequest(repository="acme/cached")
+    first = asyncio.run(manager.resolve(target, "127.0.0.1"))
+    second = asyncio.run(manager.resolve(target, "127.0.0.1"))
+    assert first == second
+    assert calls == 1
+
+
 def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> None:
     settings = Settings.from_env()
     identity = RepositoryIdentity(
@@ -191,6 +232,78 @@ def test_nested_skills_assign_optional_files_to_nearest_skill() -> None:
     assert "skills/parent/child/references/child.md" in child_paths
 
 
+def test_manifest_declared_source_agents_are_discovered() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="agents", commit_sha="6" * 40,
+        html_url="https://github.com/owner/agents/tree/" + "6" * 40,
+    )
+    agent = b"""---
+name: Frontend Developer
+description: Builds accessible user interfaces.
+color: cyan
+emoji: screen
+vibe: Precise and pragmatic.
+---
+
+# Frontend Developer Agent Personality
+
+Build the interface carefully.
+"""
+    result = analyze_archive(archive({
+        "divisions.json": b'{"divisions":{"engineering":{"label":"Engineering"}}}',
+        "engineering/frontend-developer.md": agent,
+        "strategy/playbook.md": agent,
+        "README.md": b"Repository overview.",
+    }), identity, "o200k_base", settings)
+
+    assert len(result.report.inventory) == 1
+    discovered = result.report.inventory[0]
+    assert discovered.kind == "agent"
+    assert discovered.path == "engineering/frontend-developer.md"
+    assert discovered.name == "Frontend Developer"
+    assert discovered.description == "Builds accessible user interfaces."
+    assert discovered.harnesses == ["claude_code", "github_copilot"]
+    assert discovered.tokens and discovered.tokens > 0
+
+
+def test_manifest_agent_requires_identity_frontmatter() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="agents", commit_sha="5" * 40,
+        html_url="https://github.com/owner/agents/tree/" + "5" * 40,
+    )
+    result = analyze_archive(archive({
+        "divisions.json": b'{"divisions":{"engineering":{}}}',
+        "engineering/README.md": b"# Division overview",
+    }), identity, "o200k_base", settings)
+
+    assert result.report.inventory == []
+    assert result.report.warnings[0].code == "invalid_agent"
+
+
+def test_manifest_agent_tolerates_unquoted_colon_in_description() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="agents", commit_sha="4" * 40,
+        html_url="https://github.com/owner/agents/tree/" + "4" * 40,
+    )
+    result = analyze_archive(archive({
+        "divisions.json": b'{"divisions":{"engineering":{}}}',
+        "engineering/tooling.md": b"""---
+name: Tooling Engineer
+description: Builds tools with great DX: fast, obvious, and scriptable.
+---
+
+# Tooling Engineer
+""",
+    }), identity, "o200k_base", settings)
+
+    assert len(result.report.inventory) == 1
+    assert result.report.inventory[0].name == "Tooling Engineer"
+    assert result.report.inventory[0].description == "Builds tools with great DX: fast, obvious, and scriptable."
+
+
 def test_repository_relevant_file_limit_is_independent_of_upload_limit() -> None:
     settings = replace(
         Settings.from_env(), max_items=1, repo_max_relevant_files=1100
@@ -226,10 +339,45 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["mode"] == "repository"
+    assert 0 < first.json()["metadata_tokens"] < first.json()["category_totals"]["all_discovered_text"]
     assert second.json()["cached"] is True
     assert calls == 1
     conditional = request("GET", path, headers={"if-none-match": first.headers["etag"]})
     assert conditional.status_code == 304
+
+
+def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    sha = "7" * 40
+    resolve_calls = 0
+
+    async def fake_resolve(request: RepositoryResolveRequest, _: str):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return type("Resolved", (), {"repository": RepositoryIdentity(
+            owner="acme", name="fixture", commit_sha=sha,
+            html_url=f"https://github.com/acme/fixture/tree/{sha}",
+            subdirectory=request.subdirectory,
+        )})()
+
+    payload = archive({"skills/demo/SKILL.md": SKILL.encode()})
+
+    async def fake_archive(owner: str, repository: str, commit: str) -> bytes:
+        return payload
+
+    monkeypatch.setattr(repositories, "resolve", fake_resolve)
+    monkeypatch.setattr(repositories.gateway, "archive", fake_archive)
+    base = f"/badge/github/acme/fixture.svg?path=skills&ref={sha}"
+    total = request("GET", base + "&metric=total")
+    metadata = request("GET", base + "&metric=metadata")
+    assert total.status_code == metadata.status_code == 200
+    assert total.headers["content-type"].startswith("image/svg+xml")
+    assert total.headers["x-repository-commit"] == sha
+    assert total.headers["x-badge-metric"] == "total"
+    assert "total tokens" in total.text
+    assert "metadata tokens" in metadata.text
+    assert total.text != metadata.text
+    assert "unavailable" not in total.text + metadata.text
+    assert resolve_calls == 1
 
 
 def test_subdirectories_share_one_full_repository_cache_entry(monkeypatch: pytest.MonkeyPatch) -> None:

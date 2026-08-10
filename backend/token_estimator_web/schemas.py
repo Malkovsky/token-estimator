@@ -226,6 +226,7 @@ class RepositoryReport(ApiModel):
     method: MethodInfo
     analyzer_version: str
     inventory: list[InventoryItem]
+    metadata_tokens: int = Field(ge=0)
     category_totals: dict[str, int]
     warnings: list[ScanWarning]
     scan: ScanStats

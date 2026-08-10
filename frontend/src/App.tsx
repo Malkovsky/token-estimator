@@ -7,6 +7,8 @@ import type {
   ScenarioResponse, SkillsResponse,
 } from "./types";
 
+type BadgeMetric = "metadata" | "total";
+
 declare global {
   interface Window {
     turnstile?: {
@@ -151,6 +153,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
   const [nativeResult, setNativeResult] = useState<{ input_tokens: number; cached: boolean; model: string } | null>(null);
   const [busy, setBusy] = useState(true);
   const [nativeBusy, setNativeBusy] = useState(false);
+  const [badgeCopied, setBadgeCopied] = useState<BadgeMetric | null>(null);
   const [error, setError] = useState("");
   const { token, reset } = useTurnstile(capabilities);
 
@@ -191,6 +194,24 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     finally { setNativeBusy(false); reset(); }
   }
 
+  function badgeUrl(metric: BadgeMetric) {
+    if (!report) return "";
+    const badge = new URL(`/badge/github/${encodeURIComponent(report.repository.owner)}/${encodeURIComponent(report.repository.name)}.svg`, window.location.origin);
+    badge.searchParams.set("metric", metric);
+    badge.searchParams.set("ref", report.repository.commit_sha);
+    badge.searchParams.set("encoding", report.method.encoding);
+    if (report.repository.subdirectory) badge.searchParams.set("path", report.repository.subdirectory);
+    return badge.toString();
+  }
+
+  async function copyBadge(metric: BadgeMetric) {
+    if (!report) return;
+    const label = metric === "metadata" ? "Metadata tokens" : "Total tokens";
+    await navigator.clipboard.writeText(`[![${label}](${badgeUrl(metric)})](${window.location.href})`);
+    setBadgeCopied(metric);
+    window.setTimeout(() => setBadgeCopied(null), 1800);
+  }
+
   if (busy) return <Shell design={design} preview={preview} screen="report"><div className="state"><div className="spinner" /><h1>Inspecting repository snapshot…</h1><p>Fetching only the immutable public commit and scanning bounded text candidates.</p></div></Shell>;
   if (!report) return <Shell design={design} preview={preview} screen="report"><div className="state"><h1>Could not load this report</h1><p className="error">{error}</p><a href={preview ? designPath(design) : "/"}>Try another repository</a></div></Shell>;
   const enabledProviders = capabilities?.native_providers.filter((item) => item.enabled) || [];
@@ -203,6 +224,12 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     <div><span>Inventory</span><strong>{number(report.inventory.length)}</strong><small>loadable artifacts</small></div>
     <div><span>Relevant files</span><strong>{number(report.scan.relevant_files)}</strong><small>{number(report.scan.relevant_bytes)} bytes</small></div>
     <div><span>Tokenizer</span><strong>{report.method.encoding}</strong><small>tiktoken {report.method.version}</small></div>
+  </section>
+  <section className="report-badges" aria-label="README badges">
+    {(["metadata", "total"] as BadgeMetric[]).map((metric) => <div className="badge-share" key={metric}>
+      <img src={badgeUrl(metric)} alt={`${metric === "metadata" ? "Metadata" : "Total"} token badge`} />
+      <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
+    </div>)}
   </section>
   <p className="inventory-note">Totals sum discovered repository text. They are not an estimate of one simultaneously active harness prompt.</p>
   <section className="report-grid"><div>

@@ -7,7 +7,7 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -16,6 +16,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .badges import token_badge_svg
 from .config import Settings
 from .errors import ServiceProblem
 from .middleware import (
@@ -224,6 +225,61 @@ async def repository_report(
     if raw.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     return JSONResponse(content=analysis.report.model_dump(mode="json"), headers=headers)
+
+
+@app.get(
+    "/badge/github/{owner}/{repository}.svg",
+    responses={200: {"content": {"image/svg+xml": {}}}},
+    tags=["badges"],
+)
+async def repository_badge(
+    owner: str, repository: str, raw: Request,
+    ref: str | None = None, path: str | None = None, encoding: str | None = None,
+    metric: Literal["metadata", "total"] = "total",
+) -> Response:
+    """Render a README badge for the selected repository snapshot."""
+    ip = client_ip(raw, settings)
+    try:
+        analysis = await repositories.get_cached(
+            owner, repository, ref, path, encoding
+        )
+        commit_sha = ref or ""
+        if analysis is None:
+            resolved = await repositories.resolve(
+                RepositoryResolveRequest(
+                    repository=f"{owner}/{repository}", ref=ref,
+                    subdirectory=path, encoding=encoding,
+                ),
+                ip,
+            )
+            analysis = await repositories.get(
+                resolved.repository.owner, resolved.repository.name,
+                resolved.repository.commit_sha, resolved.repository.subdirectory,
+                encoding, ip,
+            )
+            commit_sha = resolved.repository.commit_sha
+        tokens = (
+            analysis.report.metadata_tokens
+            if metric == "metadata"
+            else analysis.report.category_totals.get("all_discovered_text", 0)
+        )
+        label = "metadata tokens" if metric == "metadata" else "total tokens"
+        return Response(
+            content=token_badge_svg(tokens, label), media_type="image/svg+xml",
+            headers={
+                "Cache-Control": "public, max-age=300, stale-while-revalidate=3600",
+                "X-Repository-Commit": commit_sha,
+                "X-Badge-Metric": metric,
+            },
+        )
+    except ServiceProblem:
+        return Response(
+            content=token_badge_svg(
+                label="metadata tokens" if metric == "metadata" else "total tokens"
+            ),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 @app.post(

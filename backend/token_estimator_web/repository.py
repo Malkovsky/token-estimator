@@ -179,12 +179,15 @@ class GitHubGateway:
         )
         if not requested_ref or len(requested_ref) > 250 or "\x00" in requested_ref:
             raise ServiceProblem(422, "invalid_ref", "invalid Git ref")
-        commit = await self._json(
-            f"/repos/{quote(owner)}/{quote(repository)}/commits/{quote(requested_ref, safe='')}"
-        )
-        sha = commit.get("sha")
-        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
-            raise ServiceProblem(502, "github_invalid_response", "GitHub did not return a full commit SHA")
+        if _SHA.fullmatch(requested_ref):
+            sha = requested_ref.lower()
+        else:
+            commit = await self._json(
+                f"/repos/{quote(owner)}/{quote(repository)}/commits/{quote(requested_ref, safe='')}"
+            )
+            sha = commit.get("sha")
+            if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                raise ServiceProblem(502, "github_invalid_response", "GitHub did not return a full commit SHA")
         canonical_owner = metadata.get("owner", {}).get("login", owner)
         canonical_name = metadata.get("name", repository)
         subdirectory = normalize_subdirectory(request.subdirectory or location.subdirectory)
@@ -340,11 +343,27 @@ def _frontmatter_metadata(content: str) -> tuple[str | None, str | None]:
         return None, None
     try:
         closing = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
-        metadata = yaml.safe_load("\n".join(lines[1:closing])) or {}
-    except (StopIteration, yaml.YAMLError):
+    except StopIteration:
         return None, None
-    if not isinstance(metadata, dict):
-        return None, None
+    try:
+        loaded = yaml.safe_load("\n".join(lines[1:closing])) or {}
+        metadata = loaded if isinstance(loaded, dict) else {}
+    except yaml.YAMLError:
+        metadata = {}
+
+    # Some public catalogs contain otherwise valid one-line metadata with an
+    # unquoted colon. Preserve discovery with a deliberately narrow fallback.
+    if not metadata:
+        for line in lines[1:closing]:
+            if line[:1].isspace() or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key not in {"name", "title", "description"} or not value.strip():
+                continue
+            cleaned = value.strip()
+            if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+                cleaned = cleaned[1:-1]
+            metadata[key] = cleaned
     raw_name = metadata.get("name", metadata.get("title"))
     raw_description = metadata.get("description")
     name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
@@ -354,6 +373,39 @@ def _frontmatter_metadata(content: str) -> tuple[str | None, str | None]:
         else None
     )
     return name, description
+
+
+def _catalog_agent_paths(
+    tar: tarfile.TarFile,
+    members: dict[str, tarfile.TarInfo],
+    max_file_bytes: int,
+) -> set[str]:
+    """Find source agents declared by a bounded top-level divisions manifest."""
+    manifest = members.get("divisions.json")
+    manifest_limit = min(max_file_bytes, 256 * 1024)
+    if manifest is None or manifest.size > manifest_limit:
+        return set()
+    handle = tar.extractfile(manifest)
+    if handle is None:
+        return set()
+    try:
+        document = json.loads(handle.read(manifest_limit + 1).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(document, dict) or not isinstance(document.get("divisions"), dict):
+        return set()
+    roots = {
+        name
+        for name, metadata in document["divisions"].items()
+        if isinstance(name, str) and _NAME.fullmatch(name) and isinstance(metadata, dict)
+    }
+    return {
+        path
+        for path in members
+        if PurePosixPath(path).suffix.lower() == ".md"
+        and len(PurePosixPath(path).parts) > 1
+        and PurePosixPath(path).parts[0] in roots
+    }
 
 
 def _mcp_servers(path: str, content: str) -> list[McpServerSummary]:
@@ -396,6 +448,20 @@ def _aggregate_warnings(warnings: list[ScanWarning]) -> list[ScanWarning]:
                 update={"count": current.count + warning.count}
             )
     return list(grouped.values())
+
+
+def _metadata_token_total(
+    inventory: list[InventoryItem], counter: Any,
+) -> int:
+    """Count discovery identity without double-counting skill metadata."""
+    total = 0
+    for item in inventory:
+        explicit = [component.tokens for component in item.components if component.role == "metadata"]
+        if explicit:
+            total += sum(explicit)
+        else:
+            total += counter(item.name or "") + counter(item.description or "")
+    return total
 
 
 def _relative_to_scope(path: str, root: str) -> str | None:
@@ -456,6 +522,9 @@ def scope_analysis(
     report = analysis.report.model_copy(update={
         "repository": repository,
         "inventory": inventory,
+        "metadata_tokens": _metadata_token_total(
+            inventory, counter_for(analysis.report.method.encoding)
+        ),
         "category_totals": totals,
         "scan": analysis.report.scan.model_copy(update={
             "relevant_files": len(scoped_file_bytes),
@@ -523,11 +592,15 @@ def analyze_archive(
         skill_files = sorted(
             path for path in normalized_members if PurePosixPath(path).name == "SKILL.md"
         )
+        catalog_agent_paths = _catalog_agent_paths(
+            tar, normalized_members, settings.repo_max_file_bytes
+        )
         skill_roots = {PurePosixPath(path).parent for path in skill_files}
         optional_paths: dict[PurePosixPath, list[str]] = {
             root: [] for root in skill_roots
         }
         selected: set[str] = set(skill_files)
+        selected.update(catalog_agent_paths)
         for path in normalized_members:
             pure = PurePosixPath(path)
             if _detection(path):
@@ -619,7 +692,11 @@ def analyze_archive(
     for path, content in sorted(texts.items()):
         if path in owned:
             continue
-        detection = _detection(path)
+        detection = (
+            ("agent", ["claude_code", "github_copilot"], "on_demand")
+            if path in catalog_agent_paths
+            else _detection(path)
+        )
         if detection is None:
             continue
         kind, harnesses, policy = detection
@@ -634,6 +711,14 @@ def analyze_archive(
             continue
         component_id = _stable_id(path, kind)
         display_name, description = _frontmatter_metadata(content)
+        if kind == "agent" and path in catalog_agent_paths and (
+            display_name is None or description is None
+        ):
+            warnings.append(ScanWarning(
+                code="invalid_agent", message="Catalog agent requires name and description frontmatter",
+                path=path,
+            ))
+            continue
         component = InventoryComponent(
             id=component_id, path=path, role=kind, load_policy=policy,
             characters=len(content), tokens=counter(content),
@@ -654,7 +739,8 @@ def analyze_archive(
     totals["all_discovered_text"] = sum(totals.values())
     report = RepositoryReport(
         repository=identity, method=method_info(encoding), analyzer_version=settings.analyzer_version,
-        inventory=inventory, category_totals=totals,
+        inventory=inventory, metadata_tokens=_metadata_token_total(inventory, counter),
+        category_totals=totals,
         warnings=_aggregate_warnings(warnings),
         scan=ScanStats(
             archive_members=len(members), relevant_files=len(texts), relevant_bytes=total_bytes
@@ -675,6 +761,10 @@ class RepositoryManager:
             settings.report_cache_ttl_seconds,
         )
         self.singleflight = SingleFlight()
+        self.resolution_cache = AsyncTTLCache(
+            max(128, settings.report_cache_entries * 4), 4 * 1024 * 1024, 300,
+        )
+        self.resolution_singleflight = SingleFlight()
         self.quota = SlidingQuota()
 
     def cache_key(self, identity: RepositoryIdentity, encoding: str) -> str:
@@ -684,10 +774,26 @@ class RepositoryManager:
         ))
 
     async def resolve(self, request: RepositoryResolveRequest, ip: str) -> RepositoryResolveResponse:
-        await self._consume_repo_quota(ip)
+        key = request.model_dump_json()
+        cached = await self.resolution_cache.get(key)
+        if cached is not None:
+            return cached
+
+        async def load() -> RepositoryResolveResponse:
+            second = await self.resolution_cache.get(key)
+            if second is not None:
+                return second
+            await self._consume_repo_quota(ip)
+            resolved = await self.gateway.resolve(request, self.settings)
+            await self.resolution_cache.set(
+                key, resolved, len(resolved.model_dump_json())
+            )
+            return resolved
+
         try:
             return await asyncio.wait_for(
-                self.gateway.resolve(request, self.settings), self.settings.repo_timeout_seconds
+                self.resolution_singleflight.run(key, load),
+                self.settings.repo_timeout_seconds,
             )
         except asyncio.TimeoutError as error:
             raise ServiceProblem(503, "repository_timeout", "repository resolution timed out") from error
@@ -734,6 +840,25 @@ class RepositoryManager:
             return scope_analysis(full_analysis, normalized_path, cached=False)
         except asyncio.TimeoutError as error:
             raise ServiceProblem(503, "repository_timeout", "repository analysis timed out") from error
+
+    async def get_cached(
+        self, owner: str, repository: str, sha: str | None,
+        subdirectory: str | None, encoding: str | None,
+    ) -> SnapshotAnalysis | None:
+        """Return an already verified snapshot without another GitHub request."""
+        if (
+            sha is None or not _NAME.fullmatch(owner)
+            or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha)
+        ):
+            return None
+        normalized_path = normalize_subdirectory(subdirectory)
+        selected = selected_encoding(encoding, self.settings)
+        identity = RepositoryIdentity(
+            owner=owner, name=repository, commit_sha=sha.lower(),
+            html_url=f"https://github.com/{owner}/{repository}/tree/{sha.lower()}",
+        )
+        cached = await self.cache.get(self.cache_key(identity, selected))
+        return scope_analysis(cached, normalized_path, cached=True) if cached else None
 
     async def _consume_repo_quota(self, ip: str) -> None:
         if not self.settings.quotas_enabled:
