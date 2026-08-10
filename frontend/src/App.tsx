@@ -227,7 +227,9 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
   </section>
   <section className="report-badges" aria-label="README badges">
     {(["metadata", "total"] as BadgeMetric[]).map((metric) => <div className="badge-share" key={metric}>
-      <img src={badgeUrl(metric)} alt={`${metric === "metadata" ? "Metadata" : "Total"} token badge`} />
+      <a className="badge-image-link" href={window.location.href} aria-label={`Open this report from the ${metric} token badge`}>
+        <img src={badgeUrl(metric)} alt={`${metric === "metadata" ? "Metadata" : "Total"} token badge`} />
+      </a>
       <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
     </div>)}
   </section>
