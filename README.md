@@ -1,13 +1,13 @@
 # Agentic Token Estimator
 
-Count tokens across skills, instructions, prompts, agents, and MCP configuration in a public GitHub repository.
+Count prompt-facing tokens across skills, instructions, prompts, agents, and available MCP tool definitions in a public GitHub repository.
 
-Paste a repository or folder URL to inventory its skills, instructions, rules, prompts, agents, and MCP configuration. The report shows baseline token counts for every discovered artifact and can be shared as an immutable commit URL.
+Paste a repository or folder URL to inventory its skills, instructions, rules, prompts, agents, and MCP configuration. The report separates prompt-facing token counts from runtime connection configuration and can be shared as an immutable commit URL.
 
 ## What you can do
 
 - Analyze an entire public GitHub repository or one of its folders.
-- See token totals by file, artifact type, and harness.
+- See prompt-facing token totals by file, artifact type, and harness.
 - Inspect skill instructions and their supporting text separately.
 - Filter reports by path, artifact type, or compatible harness.
 - Count a selected set of components with a configured Claude or Gemini model.
@@ -33,13 +33,13 @@ owner/repository
 
 The application resolves the branch or tag to a commit and opens a report containing:
 
-- total tokens across discovered repository text;
+- total tokens across discovered prompt-facing repository text;
 - an inventory of loadable agentic artifacts;
 - token counts for each artifact and component;
 - the detected harness and loading behavior;
 - scan warnings for skipped or unreadable content.
 
-The headline total is an inventory of discovered text, not a claim that every file is loaded into one prompt at the same time.
+The headline total is an inventory of discovered prompt-facing text, not a claim that every file is loaded into one prompt at the same time. Runtime MCP connection configuration is excluded.
 
 ### Analyze a folder
 
@@ -156,11 +156,15 @@ The repository scanner recognizes common conventions for Codex, Claude Code, Gem
 - `.agents/skills`, `.claude/skills`, `.gemini/skills`, and other skill directories containing `SKILL.md`;
 - `.codex/config.toml`, `.mcp.json`, and supported harness-specific MCP configuration.
 
+MCP connection files are inventoried without treating their raw contents as model context. Reports expose and count only a canonical metadata summary containing each server name and transport. Commands, arguments, URLs, headers, environment variables, and credentials are not returned and do not contribute to prompt-facing totals. Actual MCP tool names, descriptions, and input schemas are counted when supplied to the local MCP workbench; they cannot be inferred from connection configuration without contacting or executing the server.
+
 ## Caching and limits
 
 Repository snapshots are preflighted through GitHub's recursive tree metadata, then downloaded by immutable commit SHA. Archives are streamed into a bounded temporary spool: the first 8 MiB can remain in memory and larger downloads spill to ephemeral disk. They are inspected without extraction and discarded immediately after analysis. The resulting analysis is held in a bounded in-memory cache by repository commit and tokenizer encoding. A folder selection filters that full-repository result rather than creating a separate scan.
 
-By default, repository scans allow a 100 MiB compressed archive, 512 MiB of tree-reported repository blobs, 50,000 archive members, 5,000 relevant text files, and 20 MiB of decoded relevant content. At most two cold repository scans run concurrently. Full reports use a bounded two-hour memory cache. Badges additionally retain compact commit summaries for 30 days, capped globally and at 16 snapshots per repository; moving branch badges resolve their current commit before using that cache. Cache and scan limits can be changed with the `TOKEN_ESTIMATOR_REPORT_CACHE_*`, `TOKEN_ESTIMATOR_BADGE_CACHE_*`, and `TOKEN_ESTIMATOR_REPO_*` environment variables in [`backend/token_estimator_web/config.py`](backend/token_estimator_web/config.py).
+By default, repository scans allow a 100 MiB compressed archive, 512 MiB of tree-reported repository blobs, 50,000 archive members, 5,000 relevant text files, and 20 MiB of decoded relevant content. At most two cold repository scans run concurrently and two more may wait for capacity; excess scans receive a retryable busy response. Repository work has a 120-second request lifetime, and abandoned work is cancelled once its last requester leaves. Full reports use a bounded two-hour memory cache. Badges additionally retain compact commit summaries for 30 days, capped globally and at 16 snapshots per repository; moving branch badges resolve their current commit before using that cache.
+
+With quotas enabled, ref resolution has a separate global allowance of 1,000 uncached resolutions per hour. A normal repository workflow consumes one scan allowance only when it starts a cold commit analysis, not when it resolves a branch or tag. Cold scans default to 10 per client IP and 200 globally per hour. Badge scans share the global limit but do not use client-IP allowance because README image proxies commonly share addresses. Multi-key quota updates are atomic, so a rejected global request does not consume an IP allowance. Cache and scan limits can be changed with the `TOKEN_ESTIMATOR_REPORT_CACHE_*`, `TOKEN_ESTIMATOR_BADGE_CACHE_*`, and `TOKEN_ESTIMATOR_REPO_*` environment variables in [`backend/token_estimator_web/config.py`](backend/token_estimator_web/config.py).
 
 ## Deploy on Render
 

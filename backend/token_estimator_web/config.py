@@ -63,6 +63,7 @@ class Settings:
     badge_cache_bytes: int
     badge_cache_ttl_seconds: int
     badge_cache_repo_entries: int
+    repo_ref_resolutions_per_hour: int
     repo_ip_misses_per_hour: int
     repo_global_misses_per_hour: int
     native_max_bytes: int
@@ -79,7 +80,7 @@ class Settings:
     turnstile_secret_key: str
     turnstile_expected_hostname: str
     turnstile_required: bool
-    analyzer_version: str = "repo-inventory-v7"
+    analyzer_version: str = "repo-inventory-v8"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -110,7 +111,7 @@ class Settings:
             proxy_mode=proxy_mode,
             github_token=os.getenv("GITHUB_TOKEN", ""),
             github_api_base=os.getenv("TOKEN_ESTIMATOR_GITHUB_API", "https://api.github.com"),
-            repo_timeout_seconds=_positive_int("TOKEN_ESTIMATOR_REPO_TIMEOUT_SECONDS", 60),
+            repo_timeout_seconds=_positive_int("TOKEN_ESTIMATOR_REPO_TIMEOUT_SECONDS", 120),
             repo_archive_max_bytes=_positive_int(
                 "TOKEN_ESTIMATOR_REPO_ARCHIVE_MAX_BYTES", 100 * 1024 * 1024
             ),
@@ -151,6 +152,9 @@ class Settings:
             ),
             badge_cache_repo_entries=_positive_int(
                 "TOKEN_ESTIMATOR_BADGE_CACHE_REPO_ENTRIES", 16
+            ),
+            repo_ref_resolutions_per_hour=_positive_int(
+                "TOKEN_ESTIMATOR_REPO_REF_RESOLUTIONS_PER_HOUR", 1000
             ),
             repo_ip_misses_per_hour=_positive_int(
                 "TOKEN_ESTIMATOR_REPO_IP_MISSES_PER_HOUR", 10

@@ -9,6 +9,7 @@ import json
 import re
 import tarfile
 import tempfile
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -188,12 +189,23 @@ class GitHubGateway:
             raise ServiceProblem(502, "github_invalid_response", "GitHub returned an unexpected document")
         return value
 
+    async def public_metadata(self, owner: str, repository: str) -> dict[str, Any]:
+        """Return repository metadata only when GitHub confirms it is public."""
+        if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository):
+            raise ServiceProblem(422, "invalid_repository", "invalid GitHub repository")
+        metadata = await self._json(f"/repos/{quote(owner)}/{quote(repository)}")
+        if metadata.get("private") is True or metadata.get("visibility") not in {
+            None, "public",
+        }:
+            raise ServiceProblem(
+                422, "private_repository", "private repositories are not supported"
+            )
+        return metadata
+
     async def resolve(self, request: RepositoryResolveRequest, settings: Settings) -> RepositoryResolveResponse:
         location = parse_repository_location(request.repository)
         owner, repository = location.owner, location.repository
-        metadata = await self._json(f"/repos/{quote(owner)}/{quote(repository)}")
-        if metadata.get("private") is True or metadata.get("visibility") not in {None, "public"}:
-            raise ServiceProblem(422, "private_repository", "private repositories are not supported")
+        metadata = await self.public_metadata(owner, repository)
         default_branch = metadata.get("default_branch")
         requested_ref = request.ref or location.ref or (
             default_branch if isinstance(default_branch, str) else "HEAD"
@@ -834,9 +846,25 @@ def analyze_archive(
             servers = _mcp_servers(path, content)
             if not servers:
                 warnings.append(ScanWarning(code="mcp_config_unreadable", message="No safe MCP server metadata could be read", path=path))
+            components: list[InventoryComponent] = []
+            if servers:
+                safe_metadata = "\n".join(
+                    f"{server.name}\t{server.transport}" for server in servers
+                )
+                component_id = _stable_id(path, kind, "metadata")
+                components.append(InventoryComponent(
+                    id=component_id, path=path, role="metadata",
+                    load_policy="configuration_only",
+                    characters=len(safe_metadata), tokens=counter(safe_metadata),
+                ))
+                contents[component_id] = safe_metadata
             inventory.append(InventoryItem(
                 id=_stable_id(path, kind), path=path, kind=kind, harnesses=harnesses,
-                load_policy=policy, mcp_servers=servers,
+                load_policy=policy, components=components, mcp_servers=servers,
+                accounting_note=(
+                    "Connection configuration is excluded from prompt totals; "
+                    "tool schemas are unavailable without contacting the server."
+                ),
             ))
             continue
         component_id = _stable_id(path, kind)
@@ -899,7 +927,14 @@ class RepositoryManager:
             max(128, settings.report_cache_entries * 4), 4 * 1024 * 1024, 300,
         )
         self.resolution_singleflight = SingleFlight()
+        self.public_cache = AsyncTTLCache(
+            max(128, settings.report_cache_entries * 4), 1024 * 1024, 300,
+        )
+        self.public_singleflight = SingleFlight()
         self.scan_slots = asyncio.Semaphore(settings.repo_scan_concurrent)
+        self.scan_admission_lock = asyncio.Lock()
+        self.scan_admitted = 0
+        self.scan_admission_limit = settings.repo_scan_concurrent * 2
         self.scan_executor = ThreadPoolExecutor(
             max_workers=settings.repo_scan_concurrent,
             thread_name_prefix="repository-scan",
@@ -934,6 +969,48 @@ class RepositoryManager:
             identity.owner.lower(), identity.name.lower(), identity.commit_sha.lower(),
             encoding, self.settings.analyzer_version,
         ))
+
+    @staticmethod
+    def public_cache_key(owner: str, repository: str) -> str:
+        return f"{owner.lower()}|{repository.lower()}"
+
+    async def _remember_public(self, owner: str, repository: str) -> None:
+        key = self.public_cache_key(owner, repository)
+        await self.public_cache.set(key, True, len(key) + 1)
+
+    async def _ensure_public(self, owner: str, repository: str) -> None:
+        key = self.public_cache_key(owner, repository)
+        if await self.public_cache.get(key) is not None:
+            return
+
+        async def verify() -> None:
+            if await self.public_cache.get(key) is not None:
+                return
+            await self.gateway.public_metadata(owner, repository)
+            await self._remember_public(owner, repository)
+
+        await self.public_singleflight.run(key, verify)
+
+    async def ensure_public(self, owner: str, repository: str) -> None:
+        """Verify the public-only boundary without downloading a snapshot."""
+        await self._ensure_public(owner, repository)
+
+    @asynccontextmanager
+    async def _scan_admission(self):
+        async with self.scan_admission_lock:
+            if self.scan_admitted >= self.scan_admission_limit:
+                raise ServiceProblem(
+                    503, "repository_busy",
+                    "repository analysis capacity is full; retry shortly",
+                    5,
+                )
+            self.scan_admitted += 1
+        try:
+            async with self.scan_slots:
+                yield
+        finally:
+            async with self.scan_admission_lock:
+                self.scan_admitted -= 1
 
     def badge_cache_key(
         self, owner: str, repository: str, sha: str,
@@ -986,7 +1063,8 @@ class RepositoryManager:
         )
         if analysis is None:
             analysis = await self.get(
-                owner, repository, sha, normalized_path, selected, ip
+                owner, repository, sha, normalized_path, selected, ip,
+                include_ip_quota=False,
             )
         summary = BadgeSummary(
             commit_sha=sha,
@@ -1013,8 +1091,11 @@ class RepositoryManager:
             second = await self.resolution_cache.get(key)
             if second is not None:
                 return second
-            await self._consume_repo_quota(ip)
+            await self._consume_resolution_quota()
             resolved = await self.gateway.resolve(request, self.settings)
+            await self._remember_public(
+                resolved.repository.owner, resolved.repository.name
+            )
             await self.resolution_cache.set(
                 key, resolved, len(resolved.model_dump_json())
             )
@@ -1030,7 +1111,7 @@ class RepositoryManager:
 
     async def get(
         self, owner: str, repository: str, sha: str, subdirectory: str | None,
-        encoding: str | None, ip: str,
+        encoding: str | None, ip: str, *, include_ip_quota: bool = True,
     ) -> SnapshotAnalysis:
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
@@ -1057,8 +1138,9 @@ class RepositoryManager:
             second = await self.cache.get(key)
             if second is not None:
                 return second
-            await self._consume_repo_quota(ip)
-            async with self.scan_slots:
+            async with self._scan_admission():
+                await self._consume_repo_quota(ip, include_ip_quota)
+                await self._ensure_public(owner, repository)
                 archive = await self.gateway.archive(owner, repository, sha)
                 try:
                     result = await self._analyze_in_worker(
@@ -1097,11 +1179,33 @@ class RepositoryManager:
         cached = await self.cache.get(self.cache_key(identity, selected))
         return scope_analysis(cached, normalized_path, cached=True) if cached else None
 
-    async def _consume_repo_quota(self, ip: str) -> None:
+    async def _consume_resolution_quota(self) -> None:
         if not self.settings.quotas_enabled:
             return
         try:
-            await self.quota.consume(f"repo:ip:{ip}", self.settings.repo_ip_misses_per_hour, 3600)
-            await self.quota.consume("repo:global", self.settings.repo_global_misses_per_hour, 3600)
+            await self.quota.consume(
+                "repo:resolution:global",
+                self.settings.repo_ref_resolutions_per_hour,
+                3600,
+            )
+        except QuotaExceeded as error:
+            raise ServiceProblem(
+                429, "repository_resolution_quota_exceeded",
+                "repository resolution quota exceeded", error.retry_after,
+            ) from error
+
+    async def _consume_repo_quota(
+        self, ip: str, include_ip: bool = True,
+    ) -> None:
+        if not self.settings.quotas_enabled:
+            return
+        limits = [("repo:global", self.settings.repo_global_misses_per_hour, 3600)]
+        if include_ip:
+            limits.insert(
+                0,
+                (f"repo:ip:{ip}", self.settings.repo_ip_misses_per_hour, 3600),
+            )
+        try:
+            await self.quota.consume_many(limits)
         except QuotaExceeded as error:
             raise ServiceProblem(429, "repository_quota_exceeded", "repository analysis quota exceeded", error.retry_after) from error

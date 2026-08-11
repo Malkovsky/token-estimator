@@ -10,7 +10,9 @@ import httpx
 import pytest
 
 from token_estimator_web.badges import BADGE_STYLES, compact_tokens, token_badge_svg
-from token_estimator_web.cache import AsyncTTLCache
+from token_estimator_web.cache import (
+    AsyncTTLCache, QuotaExceeded, SingleFlight, SlidingQuota,
+)
 from token_estimator_web.config import Settings
 from token_estimator_web.main import app, repositories
 from token_estimator_web.providers import NativeCountManager
@@ -54,6 +56,18 @@ def request(method: str, path: str, **kwargs: object) -> httpx.Response:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
     return asyncio.run(execute())
+
+
+@pytest.fixture(autouse=True)
+def public_global_repository_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep endpoint tests offline while preserving the public-only boundary."""
+    async def public_metadata(owner: str, repository: str) -> dict[str, object]:
+        return {
+            "private": False, "visibility": "public", "name": repository,
+            "owner": {"login": owner},
+        }
+
+    monkeypatch.setattr(repositories.gateway, "public_metadata", public_metadata)
 
 
 def test_health_capabilities_and_legacy_context() -> None:
@@ -172,6 +186,14 @@ def test_repository_resolution_is_cached(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = replace(Settings.from_env(), quotas_enabled=False)
     manager = RepositoryManager(settings)
     calls = 0
+    resolution_quota_calls = 0
+
+    async def consume_resolution_quota() -> None:
+        nonlocal resolution_quota_calls
+        resolution_quota_calls += 1
+
+    async def unexpected_scan_quota(*_: object) -> None:
+        raise AssertionError("repository resolution must not consume scan quota")
 
     async def fake_resolve(
         request: RepositoryResolveRequest, _: Settings,
@@ -189,11 +211,14 @@ def test_repository_resolution_is_cached(monkeypatch: pytest.MonkeyPatch) -> Non
         )
 
     monkeypatch.setattr(manager.gateway, "resolve", fake_resolve)
+    monkeypatch.setattr(manager, "_consume_resolution_quota", consume_resolution_quota)
+    monkeypatch.setattr(manager, "_consume_repo_quota", unexpected_scan_quota)
     target = RepositoryResolveRequest(repository="acme/cached")
     first = asyncio.run(manager.resolve(target, "127.0.0.1"))
     second = asyncio.run(manager.resolve(target, "127.0.0.1"))
     assert first == second
     assert calls == 1
+    assert resolution_quota_calls == 1
 
 
 def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> None:
@@ -221,6 +246,15 @@ def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> Non
     assert len(by_kind["instruction"]) == 1
     assert len(by_kind["rule"]) == 1
     assert {server.name for server in by_kind["mcp_config"][0].mcp_servers} == {"local", "remote"}
+    mcp_item = by_kind["mcp_config"][0]
+    assert mcp_item.tokens is None
+    assert len(mcp_item.components) == 1
+    assert mcp_item.components[0].role == "metadata"
+    safe_mcp_metadata = result.contents[mcp_item.components[0].id]
+    assert "local\tstdio" in safe_mcp_metadata
+    assert "remote\thttp" in safe_mcp_metadata
+    assert "secret" not in safe_mcp_metadata
+    assert "mcp_config" not in result.report.category_totals
     serialized = result.report.model_dump_json()
     assert "secret-command" not in serialized
     assert "https://secret" not in serialized
@@ -442,14 +476,51 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     assert 0 < first.json()["metadata_tokens"] < first.json()["category_totals"]["all_discovered_text"]
     assert second.json()["cached"] is True
     assert calls == 1
+    assert first.headers["etag"].startswith('W/"')
+
+    async def unexpected_get(*_: object) -> object:
+        raise AssertionError("a matching validator must avoid repository analysis")
+
+    monkeypatch.setattr(repositories, "get", unexpected_get)
     conditional = request("GET", path, headers={"if-none-match": first.headers["etag"]})
     assert conditional.status_code == 304
+
+
+def test_direct_snapshot_rejects_private_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RepositoryManager(replace(Settings.from_env(), quotas_enabled=False))
+    archive_called = False
+
+    async def private_metadata(_: str, __: str) -> dict[str, object]:
+        raise ServiceProblem(
+            422, "private_repository", "private repositories are not supported"
+        )
+
+    async def unexpected_archive(_: str, __: str, ___: str) -> bytes:
+        nonlocal archive_called
+        archive_called = True
+        return b""
+
+    monkeypatch.setattr(manager.gateway, "public_metadata", private_metadata)
+    monkeypatch.setattr(manager.gateway, "archive", unexpected_archive)
+    try:
+        with pytest.raises(ServiceProblem) as raised:
+            asyncio.run(manager.get(
+                "private-owner", "private-repo", "a" * 40, None,
+                "o200k_base", "127.0.0.1",
+            ))
+        assert raised.value.code == "private_repository"
+        assert archive_called is False
+    finally:
+        manager.close()
 
 
 def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
     sha = "7" * 40
     resolve_calls = 0
     archive_calls = 0
+    quota_modes: list[bool] = []
 
     async def fake_resolve(request: RepositoryResolveRequest, _: str):
         nonlocal resolve_calls
@@ -467,8 +538,12 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
         archive_calls += 1
         return payload
 
+    async def record_quota(_: str, include_ip: bool = True) -> None:
+        quota_modes.append(include_ip)
+
     monkeypatch.setattr(repositories, "resolve", fake_resolve)
     monkeypatch.setattr(repositories.gateway, "archive", fake_archive)
+    monkeypatch.setattr(repositories, "_consume_repo_quota", record_quota)
     base = f"/badge/github/acme/fixture.svg?path=skills&ref={sha}"
     total = request("GET", base + "&metric=total")
     metadata = request("GET", base + "&metric=metadata")
@@ -482,6 +557,7 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
     assert "unavailable" not in total.text + metadata.text
     assert resolve_calls == 0
     assert archive_calls == 1
+    assert quota_modes == [False]
     assert "max-age=86400" in total.headers["cache-control"]
 
 
@@ -530,6 +606,80 @@ def test_cache_enforces_group_entry_limit() -> None:
         assert await cache.get("c") == 3
 
     asyncio.run(exercise())
+
+
+def test_multi_key_quota_consumption_is_atomic() -> None:
+    async def exercise() -> None:
+        quota = SlidingQuota()
+        limits = [("ip", 2, 3600), ("global", 1, 3600)]
+        await quota.consume_many(limits)
+        with pytest.raises(QuotaExceeded):
+            await quota.consume_many(limits)
+        # The failed global check must not have consumed the second IP event.
+        await quota.consume("ip", 2, 3600)
+
+    asyncio.run(exercise())
+
+
+def test_singleflight_cancels_work_after_last_waiter_leaves() -> None:
+    async def exercise() -> None:
+        flight = SingleFlight()
+        cancelled = asyncio.Event()
+
+        async def work() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(flight.run("snapshot", work), 0.01)
+        await asyncio.wait_for(cancelled.wait(), 0.1)
+        assert flight._pending == {}
+
+    asyncio.run(exercise())
+
+
+def test_repository_scan_admission_is_bounded() -> None:
+    async def exercise() -> None:
+        manager = RepositoryManager(replace(
+            Settings.from_env(), repo_scan_concurrent=1
+        ))
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_slot() -> None:
+            async with manager._scan_admission():
+                first_entered.set()
+                await release.wait()
+
+        async def queue_for_slot() -> None:
+            async with manager._scan_admission():
+                pass
+
+        try:
+            active = asyncio.create_task(hold_slot())
+            await first_entered.wait()
+            queued = asyncio.create_task(queue_for_slot())
+            await asyncio.sleep(0)
+            with pytest.raises(ServiceProblem) as raised:
+                async with manager._scan_admission():
+                    pass
+            assert raised.value.code == "repository_busy"
+            release.set()
+            await asyncio.gather(active, queued)
+        finally:
+            manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_unknown_reserved_routes_do_not_return_the_spa() -> None:
+    for path in ("/api/v1/does-not-exist", "/badge/does-not-exist.svg"):
+        response = request("GET", path)
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json()["error"]["code"] == "not_found"
 
 
 def test_subdirectories_share_one_full_repository_cache_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -612,6 +762,8 @@ def test_quota_consumers_are_disabled_for_local_testing(monkeypatch: pytest.Monk
         raise AssertionError("quota storage should not be touched")
 
     monkeypatch.setattr(manager.quota, "consume", unexpected_consume)
+    monkeypatch.setattr(manager.quota, "consume_many", unexpected_consume)
     monkeypatch.setattr(native.quota, "consume", unexpected_consume)
     asyncio.run(manager._consume_repo_quota("127.0.0.1"))
+    asyncio.run(manager._consume_resolution_quota())
     asyncio.run(native._consume_quota("127.0.0.1"))

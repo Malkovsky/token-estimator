@@ -168,6 +168,7 @@ function InventoryCard({ item, selected, toggle }: { item: InventoryItem; select
       <span><strong>{title(component.role)}</strong><small>{component.path}</small></span><b>{number(component.tokens)}</b>
     </label>)}</div>}
     {item.mcp_servers.length > 0 && <div className="mcp-list">{item.mcp_servers.map((server) => <span key={server.name}>{server.name} · {server.transport}</span>)}</div>}
+    {item.accounting_note && <p className="inventory-accounting-note">{item.accounting_note}</p>}
   </article>;
 }
 
@@ -251,7 +252,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     <div className="header-actions"><a href={report.repository.html_url} target="_blank" rel="noreferrer">View on GitHub</a><button className="secondary-button" onClick={() => navigator.clipboard.writeText(window.location.href)}>Copy report link</button></div>
   </section>
   <section className="metrics">
-    <div><span>Discovered text</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>baseline tokens</small></div>
+    <div><span>Prompt-facing text</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>baseline tokens</small></div>
     <div><span>Inventory</span><strong>{number(report.inventory.length)}</strong><small>loadable artifacts</small></div>
     <div><span>Relevant files</span><strong>{number(report.scan.relevant_files)}</strong><small>{number(report.scan.relevant_bytes)} bytes</small></div>
     <div><span>Tokenizer</span><strong>{report.method.encoding}</strong><small>tiktoken {report.method.version}</small></div>
@@ -264,7 +265,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
       <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
     </div>)}
   </section>
-  <p className="inventory-note">Totals sum discovered repository text. They are not an estimate of one simultaneously active harness prompt.</p>
+  <p className="inventory-note">Totals sum discovered prompt-facing repository text. Runtime configuration and MCP connection secrets are excluded, and the result is not an estimate of one simultaneously active harness prompt.</p>
   <section className="report-grid"><div>
     <div className="filters"><input aria-label="Filter paths" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter paths…" /><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">All kinds</option>{kinds.map((value) => <option key={value}>{value}</option>)}</select><select value={harness} onChange={(event) => setHarness(event.target.value)}><option value="all">All harnesses</option>{harnesses.map((value) => <option key={value}>{value}</option>)}</select></div>
     <div className="inventory-list">{filtered.map((item) => <InventoryCard key={item.id} item={item} selected={selected} toggle={toggle} />)}{filtered.length === 0 && <p className="empty">No matching harness artifacts.</p>}</div>

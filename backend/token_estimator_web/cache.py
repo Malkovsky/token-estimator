@@ -74,6 +74,7 @@ class AsyncTTLCache:
 class SingleFlight:
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Task[Any]] = {}
+        self._waiters: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     async def run(self, key: str, factory: Callable[[], Awaitable[Any]]) -> Any:
@@ -82,21 +83,21 @@ class SingleFlight:
             if task is None:
                 task = asyncio.create_task(factory())
                 self._pending[key] = task
-                task.add_done_callback(
-                    lambda completed: asyncio.create_task(self._clear(key, completed))
-                )
+                self._waiters[key] = 0
+            self._waiters[key] += 1
         try:
             return await asyncio.shield(task)
         finally:
-            if task.done():
-                async with self._lock:
-                    if self._pending.get(key) is task:
+            async with self._lock:
+                if self._pending.get(key) is task:
+                    remaining = self._waiters[key] - 1
+                    if remaining > 0:
+                        self._waiters[key] = remaining
+                    else:
+                        if not task.done():
+                            task.cancel()
+                        self._waiters.pop(key, None)
                         self._pending.pop(key, None)
-
-    async def _clear(self, key: str, task: asyncio.Task[Any]) -> None:
-        async with self._lock:
-            if self._pending.get(key) is task:
-                self._pending.pop(key, None)
 
 
 class QuotaExceeded(Exception):
@@ -110,12 +111,22 @@ class SlidingQuota:
         self._lock = asyncio.Lock()
 
     async def consume(self, key: str, limit: int, window_seconds: int) -> None:
+        await self.consume_many([(key, limit, window_seconds)])
+
+    async def consume_many(
+        self, limits: list[tuple[str, int, int]],
+    ) -> None:
+        """Atomically validate and record one event across several windows."""
         now = time.monotonic()
         async with self._lock:
-            events = self._events[key]
-            while events and now - events[0] >= window_seconds:
-                events.popleft()
-            if len(events) >= limit:
-                retry = max(1, int(window_seconds - (now - events[0])))
-                raise QuotaExceeded(retry)
-            events.append(now)
+            for key, _, window_seconds in limits:
+                events = self._events[key]
+                while events and now - events[0] >= window_seconds:
+                    events.popleft()
+            for key, limit, window_seconds in limits:
+                events = self._events[key]
+                if len(events) >= limit:
+                    retry = max(1, int(window_seconds - (now - events[0])))
+                    raise QuotaExceeded(retry)
+            for key, _, _ in limits:
+                self._events[key].append(now)

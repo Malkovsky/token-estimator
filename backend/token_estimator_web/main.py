@@ -139,6 +139,16 @@ async def _read_uploads(files: list[UploadFile], paths: list[str] | None) -> lis
 ERROR_RESPONSES = {code: {"model": ErrorResponse} for code in (403, 404, 413, 415, 422, 429, 502, 503)}
 
 
+def _etag_matches(value: str | None, etag: str) -> bool:
+    if not value:
+        return False
+    expected = etag.removeprefix("W/")
+    return any(
+        candidate != "*" and candidate.removeprefix("W/") == expected
+        for candidate in (part.strip() for part in value.split(","))
+    )
+
+
 @app.get("/docs", include_in_schema=False)
 async def swagger_docs() -> Response:
     response = get_swagger_ui_html(
@@ -217,16 +227,17 @@ async def repository_report(
     owner: str, repository: str, sha: str, raw: Request,
     path: str | None = None, encoding: str | None = None,
 ) -> Response:
-    analysis = await repositories.get(
-        owner, repository, sha, path, encoding, client_ip(raw, settings)
-    )
     etag_value = hashlib.sha256(
         f"{owner}|{repository}|{sha}|{path}|{encoding}|{settings.analyzer_version}".encode()
     ).hexdigest()
-    etag = f'"{etag_value}"'
+    etag = f'W/"{etag_value}"'
     headers = {"ETag": etag, "Cache-Control": "public, max-age=600, must-revalidate"}
-    if raw.headers.get("if-none-match") == etag:
+    if _etag_matches(raw.headers.get("if-none-match"), etag):
+        await repositories.ensure_public(owner, repository)
         return Response(status_code=304, headers=headers)
+    analysis = await repositories.get(
+        owner, repository, sha, path, encoding, client_ip(raw, settings)
+    )
     return JSONResponse(content=analysis.report.model_dump(mode="json"), headers=headers)
 
 
@@ -364,6 +375,21 @@ async def context_upload(
 @app.post("/api/v1/scenarios/estimate", response_model=ScenarioResponse, responses=ERROR_RESPONSES, tags=["local"])
 async def scenario(request: ScenarioRequest) -> ScenarioResponse:
     return await run_estimate(estimate_scenario, request, settings)
+
+
+_NOT_FOUND_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+@app.api_route("/api", methods=_NOT_FOUND_METHODS, include_in_schema=False)
+@app.api_route("/api/{full_path:path}", methods=_NOT_FOUND_METHODS, include_in_schema=False)
+@app.api_route("/badge", methods=_NOT_FOUND_METHODS, include_in_schema=False)
+@app.api_route("/badge/{full_path:path}", methods=_NOT_FOUND_METHODS, include_in_schema=False)
+async def reserved_namespace_not_found(full_path: str = "") -> JSONResponse:
+    """Keep API and badge typos out of the frontend history fallback."""
+    return JSONResponse(
+        status_code=404,
+        content=error_payload("not_found", "endpoint was not found"),
+    )
 
 
 DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"

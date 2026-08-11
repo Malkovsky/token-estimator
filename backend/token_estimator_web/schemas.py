@@ -204,6 +204,7 @@ class InventoryItem(ApiModel):
     tokens: int | None = Field(default=None, ge=0)
     components: list[InventoryComponent] = Field(default_factory=list)
     mcp_servers: list[McpServerSummary] = Field(default_factory=list)
+    accounting_note: str | None = None
 
 
 class ScanWarning(ApiModel):
