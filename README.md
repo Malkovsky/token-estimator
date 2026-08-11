@@ -53,9 +53,10 @@ You can also enter the repository and subdirectory separately under **Advanced o
 
 ### Add a token badge to a README
 
-Repository reports show separate metadata and total-token badges with a copy button next to each. Paste the resulting Markdown into a README:
+Repository reports show a combined token summary plus separate metadata and total-token badges, with a copy button next to each. Paste the resulting Markdown into a README:
 
 ```markdown
+[![Token summary](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=summary)](https://agentic-token-estimator.onrender.com/)
 [![Metadata tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=metadata)](https://agentic-token-estimator.onrender.com/)
 [![Total tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=total)](https://agentic-token-estimator.onrender.com/)
 ```

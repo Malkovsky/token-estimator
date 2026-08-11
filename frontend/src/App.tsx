@@ -7,7 +7,7 @@ import type {
   ScenarioResponse, SkillsResponse,
 } from "./types";
 
-type BadgeMetric = "metadata" | "total";
+type BadgeMetric = "metadata" | "total" | "summary";
 type BadgeStyle = "blueprint" | "classic" | "outline" | "capsule" | "terminal" | "paper" | "signal" | "mono" | "soft" | "minimal";
 
 const badgeDesigns: { id: BadgeStyle; name: string; description: string; traits: string[] }[] = [
@@ -34,6 +34,7 @@ declare global {
 
 const number = (value: number | null | undefined) => value == null ? "—" : new Intl.NumberFormat().format(value);
 const title = (value: string) => value.replaceAll("_", " ");
+const badgeLabel = (metric: BadgeMetric) => metric === "summary" ? "Token summary" : metric === "metadata" ? "Metadata tokens" : "Total tokens";
 
 function Shell({ children, design = CANONICAL_DESIGN, preview = false, screen = "landing" }: { children: React.ReactNode; design?: DesignId; preview?: boolean; screen?: DesignScreen }) {
   const home = preview || design !== CANONICAL_DESIGN ? designPath(design) : "/";
@@ -78,13 +79,14 @@ function DesignGallery() {
 
 function BadgeDesignGallery() {
   return <Shell><section className="badge-gallery-header">
-    <p className="eyebrow">Ten directions · two live values</p>
+    <p className="eyebrow">Ten directions · three badge formats</p>
     <h1>Choose the badge system.</h1>
     <p className="lede">Every variant is a production-ready SVG using the same metadata and total token values. The existing Blueprint badge remains the default while you compare them.</p>
   </section>
   <section className="badge-design-gallery">{badgeDesigns.map((design, index) => <article className="badge-design-card" key={design.id}>
     <div className="badge-design-title"><span>{String(index + 1).padStart(2, "0")}</span><div><h2>{design.name}</h2><p>{design.description}</p></div></div>
     <div className={`badge-preview-surface badge-preview-${design.id}`}>
+      <img src={`/badge/preview/${design.id}/summary.svg?v=3`} alt={`${design.name} token summary badge`} />
       <img src={`/badge/preview/${design.id}/metadata.svg?v=2`} alt={`${design.name} metadata token badge`} />
       <img src={`/badge/preview/${design.id}/total.svg?v=2`} alt={`${design.name} total token badge`} />
     </div>
@@ -238,7 +240,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
 
   async function copyBadge(metric: BadgeMetric) {
     if (!report) return;
-    const label = metric === "metadata" ? "Metadata tokens" : "Total tokens";
+    const label = badgeLabel(metric);
     await navigator.clipboard.writeText(`[![${label}](${badgeUrl(metric)})](${window.location.href})`);
     setBadgeCopied(metric);
     window.setTimeout(() => setBadgeCopied(null), 1800);
@@ -258,9 +260,9 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     <div><span>Tokenizer</span><strong>{report.method.encoding}</strong><small>tiktoken {report.method.version}</small></div>
   </section>
   <section className="report-badges" aria-label="README badges">
-    {(["metadata", "total"] as BadgeMetric[]).map((metric) => <div className="badge-share" key={metric}>
-      <a className="badge-image-link" href={window.location.href} aria-label={`Open this report from the ${metric} token badge`}>
-        <img src={badgeUrl(metric)} alt={`${metric === "metadata" ? "Metadata" : "Total"} token badge`} />
+    {(["summary", "metadata", "total"] as BadgeMetric[]).map((metric) => <div className="badge-share" key={metric}>
+      <a className="badge-image-link" href={window.location.href} aria-label={`Open this report from the ${badgeLabel(metric).toLowerCase()} badge`}>
+        <img src={badgeUrl(metric)} alt={`${badgeLabel(metric)} badge`} />
       </a>
       <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
     </div>)}

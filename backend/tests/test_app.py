@@ -9,7 +9,9 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from token_estimator_web.badges import BADGE_STYLES, compact_tokens, token_badge_svg
+from token_estimator_web.badges import (
+    BADGE_STYLES, compact_tokens, token_badge_svg, token_summary_badge_svg,
+)
 from token_estimator_web.cache import (
     AsyncTTLCache, QuotaExceeded, SingleFlight, SlidingQuota,
 )
@@ -98,6 +100,11 @@ def test_token_badge_formatting() -> None:
     assert 'aria-label="total tokens: 573k"' in svg
     assert "#145eb5" in svg
     assert "unavailable" in token_badge_svg(label="metadata tokens")
+    summary = token_summary_badge_svg(11_270, 814_027)
+    assert 'aria-label="tokens: metadata 11k, total 814k"' in summary
+    assert ">tokens</text>" in summary
+    assert summary.count('font-weight="700"') == 2
+    assert "unavailable" in token_summary_badge_svg()
     for style in BADGE_STYLES:
         styled = token_badge_svg(11_270, "metadata tokens", style)
         assert 'aria-label="metadata tokens: 11k"' in styled
@@ -115,6 +122,9 @@ def test_badge_design_preview_endpoints() -> None:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("image/svg+xml")
         assert "metadata tokens: 11k" in response.text
+        summary = request("GET", f"/badge/preview/{style}/summary.svg")
+        assert summary.status_code == 200
+        assert "tokens: metadata 11k, total 814k" in summary.text
 
 
 def test_legacy_skill_mcp_and_scenario() -> None:
@@ -614,14 +624,18 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
     base = f"/badge/github/acme/fixture.svg?path=skills&ref={sha}"
     total = request("GET", base + "&metric=total")
     metadata = request("GET", base + "&metric=metadata")
-    assert total.status_code == metadata.status_code == 200
+    summary = request("GET", base + "&metric=summary")
+    assert total.status_code == metadata.status_code == summary.status_code == 200
     assert total.headers["content-type"].startswith("image/svg+xml")
     assert total.headers["x-repository-commit"] == sha
     assert total.headers["x-badge-metric"] == "total"
+    assert summary.headers["x-badge-metric"] == "summary"
     assert "total tokens" in total.text
     assert "metadata tokens" in metadata.text
+    assert "tokens: metadata" in summary.text
+    assert ", total " in summary.text
     assert total.text != metadata.text
-    assert "unavailable" not in total.text + metadata.text
+    assert "unavailable" not in total.text + metadata.text + summary.text
     assert resolve_calls == 0
     assert archive_calls == 1
     assert quota_modes == [False]

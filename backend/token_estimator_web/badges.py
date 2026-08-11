@@ -160,3 +160,79 @@ def token_badge_svg(
     <text x="{value_center:g}" y="{baseline:g}" fill="{value_text}" font-weight="700">{escape(value)}</text>
   </g>
 </svg>'''
+
+
+def token_summary_badge_svg(
+    metadata_tokens: int | None = None,
+    total_tokens: int | None = None,
+    style: BadgeStyle = "blueprint",
+) -> str:
+    """Return a three-segment metadata/total token summary badge."""
+    visual = _VISUALS[style]
+    metadata = (
+        compact_tokens(metadata_tokens) if metadata_tokens is not None else "unavailable"
+    )
+    total = compact_tokens(total_tokens) if total_tokens is not None else "unavailable"
+    icon_width = 32 if visual.icon else 0
+    label_width = max(78, 18 + icon_width + len("tokens") * 6)
+    metadata_width = max(48, 14 + len(metadata) * 7)
+    total_width = max(48, 14 + len(total) * 7)
+    total_start = label_width + metadata_width
+    width = total_start + total_width
+    label_center = icon_width + (label_width - icon_width) / 2
+    metadata_center = label_width + metadata_width / 2
+    total_center = total_start + total_width / 2
+    baseline = visual.height / 2 + 4
+    accessible = escape(
+        f"tokens: metadata {metadata}, total {total}", quote=True
+    )
+    metadata_fill = visual.value_fill if metadata_tokens is not None else "#a33a3a"
+    metadata_text = visual.value_text if metadata_tokens is not None else "#fff"
+    total_fill = visual.label_fill if total_tokens is not None else "#a33a3a"
+    total_text = visual.label_text if total_tokens is not None else "#fff"
+    shine = (
+        f'<rect width="{width}" height="{visual.height}" fill="url(#s)"/>'
+        if visual.shine else ""
+    )
+    border = (
+        f'<rect x=".5" y=".5" width="{width - 1}" height="{visual.height - 1}" '
+        f'rx="{max(0, visual.radius - 1)}" fill="none" stroke="{visual.border}"/>'
+        if visual.border else ""
+    )
+    divider_stroke = visual.border or "#fff"
+    dividers = (
+        f'<path d="M{label_width} 1v{visual.height - 2}M{total_start} 1v{visual.height - 2}" '
+        f'stroke="{divider_stroke}" stroke-opacity=".45"/>'
+    )
+    icon_panel = (
+        f'<rect width="{icon_width}" height="{visual.height}" fill="{visual.icon_fill}"/>'
+        if visual.icon and visual.icon_fill else ""
+    )
+    icon = (
+        f'<g transform="translate(0 {(visual.height - 20) / 2:g})">'
+        f'<path d="M9 5H6v10h3M23 5h3v10h-3" fill="none" '
+        f'stroke="{visual.icon_stroke}" stroke-width="1"/>'
+        f'<path d="M12 7.5h8M12 10h8M12 12.5h8" fill="none" '
+        f'stroke="{visual.dash_stroke or visual.icon_stroke}" stroke-width="1"/></g>'
+        if visual.icon else ""
+    )
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{visual.height}" role="img" aria-label="{accessible}">
+  <title>{accessible}</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#fff" stop-opacity=".14"/>
+    <stop offset="1" stop-opacity=".09"/>
+  </linearGradient>
+  <clipPath id="r"><rect width="{width}" height="{visual.height}" rx="{visual.radius}"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="{label_width}" height="{visual.height}" fill="{visual.label_fill}"/>
+    <rect x="{label_width}" width="{metadata_width}" height="{visual.height}" fill="{metadata_fill}"/>
+    <rect x="{total_start}" width="{total_width}" height="{visual.height}" fill="{total_fill}"/>
+    {icon_panel}{shine}{dividers}{icon}
+  </g>
+  {border}
+  <g text-anchor="middle" font-family="{visual.font}" font-size="11">
+    <text x="{label_center:g}" y="{baseline:g}" fill="{visual.label_text}">tokens</text>
+    <text x="{metadata_center:g}" y="{baseline:g}" fill="{metadata_text}" font-weight="700">{escape(metadata)}</text>
+    <text x="{total_center:g}" y="{baseline:g}" fill="{total_text}" font-weight="700">{escape(total)}</text>
+  </g>
+</svg>'''
