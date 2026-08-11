@@ -60,6 +60,8 @@ Repository reports show separate metadata and total-token badges with a copy but
 [![Total tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=total)](https://agentic-token-estimator.onrender.com/)
 ```
 
+Copied badges are pinned to the report's immutable commit. To make a badge follow a branch instead, use the branch name as `ref`, for example `ref=main` or `ref=release%2F2.x`. Each moving badge periodically resolves its branch head; branches at the same commit share one cached token summary.
+
 Badge URLs follow the repository's default branch unless `ref` is supplied. They also accept the same optional `path` and `encoding` query parameters as repository analysis. The report action pins `ref` to the analyzed commit so its badge remains consistent with the linked report.
 
 ### Choose a tokenizer
@@ -156,9 +158,9 @@ The repository scanner recognizes common conventions for Codex, Claude Code, Gem
 
 ## Caching and limits
 
-Repository archives are downloaded by immutable commit SHA, inspected without extraction, and discarded after analysis. The resulting analysis is held in a bounded in-memory cache by repository commit and tokenizer encoding. A folder selection filters that full-repository result rather than creating a separate scan.
+Repository snapshots are preflighted through GitHub's recursive tree metadata, then downloaded by immutable commit SHA. Archives are streamed into a bounded temporary spool: the first 8 MiB can remain in memory and larger downloads spill to ephemeral disk. They are inspected without extraction and discarded immediately after analysis. The resulting analysis is held in a bounded in-memory cache by repository commit and tokenizer encoding. A folder selection filters that full-repository result rather than creating a separate scan.
 
-By default, repository scans accept up to 5,000 relevant text files and 20 MiB of decoded relevant content. Cache and scan limits can be changed with the `TOKEN_ESTIMATOR_REPORT_CACHE_*` and `TOKEN_ESTIMATOR_REPO_*` environment variables in [`backend/token_estimator_web/config.py`](backend/token_estimator_web/config.py).
+By default, repository scans allow a 100 MiB compressed archive, 512 MiB of tree-reported repository blobs, 50,000 archive members, 5,000 relevant text files, and 20 MiB of decoded relevant content. At most two cold repository scans run concurrently. Full reports use a bounded two-hour memory cache. Badges additionally retain compact commit summaries for 30 days, capped globally and at 16 snapshots per repository; moving branch badges resolve their current commit before using that cache. Cache and scan limits can be changed with the `TOKEN_ESTIMATOR_REPORT_CACHE_*`, `TOKEN_ESTIMATOR_BADGE_CACHE_*`, and `TOKEN_ESTIMATOR_REPO_*` environment variables in [`backend/token_estimator_web/config.py`](backend/token_estimator_web/config.py).
 
 ## Deploy on Render
 

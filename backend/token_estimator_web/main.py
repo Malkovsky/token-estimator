@@ -16,7 +16,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .badges import token_badge_svg
+from .badges import BadgeStyle, token_badge_svg
 from .config import Settings
 from .errors import ServiceProblem
 from .middleware import (
@@ -47,7 +47,10 @@ native_counts = NativeCountManager(settings, repositories)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     method_info(settings.default_encoding)
-    yield
+    try:
+        yield
+    finally:
+        repositories.close()
 
 
 app = FastAPI(
@@ -236,50 +239,55 @@ async def repository_badge(
     owner: str, repository: str, raw: Request,
     ref: str | None = None, path: str | None = None, encoding: str | None = None,
     metric: Literal["metadata", "total"] = "total",
+    style: BadgeStyle = "blueprint",
 ) -> Response:
     """Render a README badge for the selected repository snapshot."""
     ip = client_ip(raw, settings)
     try:
-        analysis = await repositories.get_cached(
-            owner, repository, ref, path, encoding
+        summary = await repositories.badge_summary(
+            owner, repository, ref, path, encoding, ip
         )
-        commit_sha = ref or ""
-        if analysis is None:
-            resolved = await repositories.resolve(
-                RepositoryResolveRequest(
-                    repository=f"{owner}/{repository}", ref=ref,
-                    subdirectory=path, encoding=encoding,
-                ),
-                ip,
-            )
-            analysis = await repositories.get(
-                resolved.repository.owner, resolved.repository.name,
-                resolved.repository.commit_sha, resolved.repository.subdirectory,
-                encoding, ip,
-            )
-            commit_sha = resolved.repository.commit_sha
         tokens = (
-            analysis.report.metadata_tokens
+            summary.metadata_tokens
             if metric == "metadata"
-            else analysis.report.category_totals.get("all_discovered_text", 0)
+            else summary.total_tokens
         )
         label = "metadata tokens" if metric == "metadata" else "total tokens"
+        cache_control = (
+            "public, max-age=300, stale-while-revalidate=3600"
+            if summary.mutable_ref
+            else "public, max-age=86400, stale-while-revalidate=604800"
+        )
         return Response(
-            content=token_badge_svg(tokens, label), media_type="image/svg+xml",
+            content=token_badge_svg(tokens, label, style), media_type="image/svg+xml",
             headers={
-                "Cache-Control": "public, max-age=300, stale-while-revalidate=3600",
-                "X-Repository-Commit": commit_sha,
+                "Cache-Control": cache_control,
+                "X-Repository-Commit": summary.commit_sha,
                 "X-Badge-Metric": metric,
             },
         )
     except ServiceProblem:
         return Response(
             content=token_badge_svg(
-                label="metadata tokens" if metric == "metadata" else "total tokens"
+                label="metadata tokens" if metric == "metadata" else "total tokens",
+                style=style,
             ),
             media_type="image/svg+xml",
             headers={"Cache-Control": "no-store"},
         )
+
+
+@app.get("/badge/preview/{style}/{metric}.svg", include_in_schema=False)
+async def badge_preview(
+    style: BadgeStyle, metric: Literal["metadata", "total"],
+) -> Response:
+    """Render deterministic samples for the local badge design gallery."""
+    tokens = 11_270 if metric == "metadata" else 814_027
+    label = "metadata tokens" if metric == "metadata" else "total tokens"
+    return Response(
+        content=token_badge_svg(tokens, label, style), media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post(

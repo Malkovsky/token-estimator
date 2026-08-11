@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import io
 import tarfile
+import tempfile
 from dataclasses import replace
 
 import httpx
 import pytest
 
-from token_estimator_web.badges import compact_tokens, token_badge_svg
+from token_estimator_web.badges import BADGE_STYLES, compact_tokens, token_badge_svg
+from token_estimator_web.cache import AsyncTTLCache
 from token_estimator_web.config import Settings
 from token_estimator_web.main import app, repositories
 from token_estimator_web.providers import NativeCountManager
@@ -80,6 +82,23 @@ def test_token_badge_formatting() -> None:
     assert 'aria-label="total tokens: 573k"' in svg
     assert "#145eb5" in svg
     assert "unavailable" in token_badge_svg(label="metadata tokens")
+    for style in BADGE_STYLES:
+        styled = token_badge_svg(11_270, "metadata tokens", style)
+        assert 'aria-label="metadata tokens: 11k"' in styled
+        assert styled.startswith("<svg")
+        if style not in {"classic", "minimal"}:
+            assert '<rect width="32"' in styled
+            assert 'd="M9 5H6v10h3M23 5h3v10h-3"' in styled
+        if style in {"blueprint", "outline", "capsule", "soft"}:
+            assert 'stroke="#ffcc55"' in styled
+
+
+def test_badge_design_preview_endpoints() -> None:
+    for style in BADGE_STYLES:
+        response = request("GET", f"/badge/preview/{style}/metadata.svg")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("image/svg+xml")
+        assert "metadata tokens: 11k" in response.text
 
 
 def test_legacy_skill_mcp_and_scenario() -> None:
@@ -322,6 +341,87 @@ def test_repository_relevant_file_limit_is_independent_of_upload_limit() -> None
     assert len(result.report.inventory) == 1001
 
 
+def test_file_backed_archive_analysis_and_stream_limits() -> None:
+    settings = replace(
+        Settings.from_env(),
+        repo_archive_max_bytes=64,
+        repo_archive_memory_bytes=8,
+    )
+    gateway = GitHubGateway(settings)
+    response = httpx.Response(
+        200,
+        content=b"x" * 32,
+        request=httpx.Request("GET", "https://codeload.github.com/archive"),
+    )
+    streamed = asyncio.run(gateway._read_limited(response))
+    try:
+        assert streamed.read() == b"x" * 32
+        assert getattr(streamed, "_rolled", False) is True
+    finally:
+        streamed.close()
+
+    oversized = httpx.Response(
+        200,
+        content=b"x" * 65,
+        request=httpx.Request("GET", "https://codeload.github.com/archive"),
+    )
+    with pytest.raises(ServiceProblem) as raised:
+        asyncio.run(gateway._read_limited(oversized))
+    assert raised.value.code == "archive_too_large"
+
+    identity = RepositoryIdentity(
+        owner="owner", name="spooled", commit_sha="8" * 40,
+        html_url="https://github.com/owner/spooled/tree/" + "8" * 40,
+    )
+    payload = archive({"skills/demo/SKILL.md": SKILL.encode()})
+    with tempfile.SpooledTemporaryFile(max_size=8, mode="w+b") as file:
+        file.write(payload)
+        result = analyze_archive(file, identity, "o200k_base", Settings.from_env())
+    assert len(result.report.inventory) == 1
+
+
+def test_repository_tree_preflight_rejects_unsafe_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(),
+        repo_max_total_bytes=100,
+        repo_max_content_bytes=5,
+        repo_max_file_bytes=10,
+    )
+    gateway = GitHubGateway(settings)
+
+    async def truncated(_: str) -> dict[str, object]:
+        return {"tree": [], "truncated": True}
+
+    monkeypatch.setattr(gateway, "_json", truncated)
+    with pytest.raises(ServiceProblem) as raised:
+        asyncio.run(gateway._preflight("owner", "repo", "a" * 40))
+    assert raised.value.code == "repository_tree_too_large"
+
+    async def malformed(_: str) -> dict[str, object]:
+        return {"tree": ["not-an-entry"], "truncated": False}
+
+    monkeypatch.setattr(gateway, "_json", malformed)
+    with pytest.raises(ServiceProblem) as raised:
+        asyncio.run(gateway._preflight("owner", "repo", "a" * 40))
+    assert raised.value.code == "github_invalid_response"
+
+    async def excessive_relevant(_: str) -> dict[str, object]:
+        return {
+            "tree": [{
+                "path": "skills/demo/SKILL.md", "type": "blob",
+                "size": 6, "sha": "b" * 40,
+            }],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(gateway, "_json", excessive_relevant)
+    with pytest.raises(ServiceProblem) as raised:
+        asyncio.run(gateway._preflight("owner", "repo", "a" * 40))
+    assert raised.value.code == "relevant_content_too_large"
+
+
 def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = archive({"SKILL.md": SKILL.encode(), "AGENTS.md": b"Rules"})
     calls = 0
@@ -349,6 +449,7 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
     sha = "7" * 40
     resolve_calls = 0
+    archive_calls = 0
 
     async def fake_resolve(request: RepositoryResolveRequest, _: str):
         nonlocal resolve_calls
@@ -362,6 +463,8 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
     payload = archive({"skills/demo/SKILL.md": SKILL.encode()})
 
     async def fake_archive(owner: str, repository: str, commit: str) -> bytes:
+        nonlocal archive_calls
+        archive_calls += 1
         return payload
 
     monkeypatch.setattr(repositories, "resolve", fake_resolve)
@@ -377,7 +480,56 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
     assert "metadata tokens" in metadata.text
     assert total.text != metadata.text
     assert "unavailable" not in total.text + metadata.text
-    assert resolve_calls == 1
+    assert resolve_calls == 0
+    assert archive_calls == 1
+    assert "max-age=86400" in total.headers["cache-control"]
+
+
+def test_branch_badges_share_summaries_by_resolved_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_sha = "1" * 40
+    develop_sha = "2" * 40
+    heads = {"main": main_sha, "stable": main_sha, "develop": develop_sha}
+    archive_calls: list[str] = []
+
+    async def fake_resolve(request: RepositoryResolveRequest, _: str):
+        sha = heads[request.ref or "main"]
+        return type("Resolved", (), {"repository": RepositoryIdentity(
+            owner="branch-test", name="fixture", commit_sha=sha,
+            html_url=f"https://github.com/branch-test/fixture/tree/{sha}",
+            subdirectory=request.subdirectory,
+        )})()
+
+    async def fake_archive(owner: str, repository: str, commit: str) -> bytes:
+        archive_calls.append(commit)
+        return archive({"skills/demo/SKILL.md": SKILL.encode()})
+
+    monkeypatch.setattr(repositories, "resolve", fake_resolve)
+    monkeypatch.setattr(repositories.gateway, "archive", fake_archive)
+    base = "/badge/github/branch-test/fixture.svg?metric=total&ref="
+    main = request("GET", base + "main")
+    stable = request("GET", base + "stable")
+    develop = request("GET", base + "develop")
+
+    assert main.headers["x-repository-commit"] == main_sha
+    assert stable.headers["x-repository-commit"] == main_sha
+    assert develop.headers["x-repository-commit"] == develop_sha
+    assert archive_calls == [main_sha, develop_sha]
+    assert "max-age=300" in main.headers["cache-control"]
+
+
+def test_cache_enforces_group_entry_limit() -> None:
+    async def exercise() -> None:
+        cache = AsyncTTLCache(max_entries=10, max_weight=100, ttl_seconds=60)
+        await cache.set("a", 1, group="repo", max_group_entries=2)
+        await cache.set("b", 2, group="repo", max_group_entries=2)
+        await cache.set("c", 3, group="repo", max_group_entries=2)
+        assert await cache.get("a") is None
+        assert await cache.get("b") == 2
+        assert await cache.get("c") == 3
+
+    asyncio.run(exercise())
 
 
 def test_subdirectories_share_one_full_repository_cache_entry(monkeypatch: pytest.MonkeyPatch) -> None:

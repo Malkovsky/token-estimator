@@ -49,6 +49,9 @@ class Settings:
     github_api_base: str
     repo_timeout_seconds: int
     repo_archive_max_bytes: int
+    repo_archive_memory_bytes: int
+    repo_max_total_bytes: int
+    repo_scan_concurrent: int
     repo_max_members: int
     repo_max_relevant_files: int
     repo_max_content_bytes: int
@@ -56,6 +59,10 @@ class Settings:
     report_cache_entries: int
     report_cache_bytes: int
     report_cache_ttl_seconds: int
+    badge_cache_entries: int
+    badge_cache_bytes: int
+    badge_cache_ttl_seconds: int
+    badge_cache_repo_entries: int
     repo_ip_misses_per_hour: int
     repo_global_misses_per_hour: int
     native_max_bytes: int
@@ -103,9 +110,18 @@ class Settings:
             proxy_mode=proxy_mode,
             github_token=os.getenv("GITHUB_TOKEN", ""),
             github_api_base=os.getenv("TOKEN_ESTIMATOR_GITHUB_API", "https://api.github.com"),
-            repo_timeout_seconds=_positive_int("TOKEN_ESTIMATOR_REPO_TIMEOUT_SECONDS", 30),
+            repo_timeout_seconds=_positive_int("TOKEN_ESTIMATOR_REPO_TIMEOUT_SECONDS", 60),
             repo_archive_max_bytes=_positive_int(
-                "TOKEN_ESTIMATOR_REPO_ARCHIVE_MAX_BYTES", 50 * 1024 * 1024
+                "TOKEN_ESTIMATOR_REPO_ARCHIVE_MAX_BYTES", 100 * 1024 * 1024
+            ),
+            repo_archive_memory_bytes=_positive_int(
+                "TOKEN_ESTIMATOR_REPO_ARCHIVE_MEMORY_BYTES", 8 * 1024 * 1024
+            ),
+            repo_max_total_bytes=_positive_int(
+                "TOKEN_ESTIMATOR_REPO_MAX_TOTAL_BYTES", 512 * 1024 * 1024
+            ),
+            repo_scan_concurrent=_positive_int(
+                "TOKEN_ESTIMATOR_REPO_SCAN_CONCURRENT", 2
             ),
             repo_max_members=_positive_int("TOKEN_ESTIMATOR_REPO_MAX_MEMBERS", 50_000),
             repo_max_relevant_files=_positive_int(
@@ -123,6 +139,18 @@ class Settings:
             ),
             report_cache_ttl_seconds=_positive_int(
                 "TOKEN_ESTIMATOR_REPORT_CACHE_TTL_SECONDS", 7200
+            ),
+            badge_cache_entries=_positive_int(
+                "TOKEN_ESTIMATOR_BADGE_CACHE_ENTRIES", 2048
+            ),
+            badge_cache_bytes=_positive_int(
+                "TOKEN_ESTIMATOR_BADGE_CACHE_BYTES", 8 * 1024 * 1024
+            ),
+            badge_cache_ttl_seconds=_positive_int(
+                "TOKEN_ESTIMATOR_BADGE_CACHE_TTL_SECONDS", 30 * 24 * 60 * 60
+            ),
+            badge_cache_repo_entries=_positive_int(
+                "TOKEN_ESTIMATOR_BADGE_CACHE_REPO_ENTRIES", 16
             ),
             repo_ip_misses_per_hour=_positive_int(
                 "TOKEN_ESTIMATOR_REPO_IP_MISSES_PER_HOUR", 10
@@ -156,4 +184,9 @@ class Settings:
             or (settings.gemini_api_key and settings.gemini_models)
         ) and not (settings.turnstile_site_key and settings.turnstile_secret_key):
             raise RuntimeError("enabled native providers require Turnstile keys")
+        if settings.repo_archive_memory_bytes > settings.repo_archive_max_bytes:
+            raise RuntimeError(
+                "TOKEN_ESTIMATOR_REPO_ARCHIVE_MEMORY_BYTES must not exceed "
+                "TOKEN_ESTIMATOR_REPO_ARCHIVE_MAX_BYTES"
+            )
         return settings

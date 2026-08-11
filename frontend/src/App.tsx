@@ -8,6 +8,20 @@ import type {
 } from "./types";
 
 type BadgeMetric = "metadata" | "total";
+type BadgeStyle = "blueprint" | "classic" | "outline" | "capsule" | "terminal" | "paper" | "signal" | "mono" | "soft" | "minimal";
+
+const badgeDesigns: { id: BadgeStyle; name: string; description: string; traits: string[] }[] = [
+  { id: "blueprint", name: "Blueprint", description: "The current architectural blue system with the token glyph.", traits: ["Technical", "Branded", "Crisp"] },
+  { id: "classic", name: "Classic Shields", description: "A familiar open-source badge with conventional proportions.", traits: ["Familiar", "Compact", "Neutral"] },
+  { id: "outline", name: "Technical Outline", description: "White fields and precise blue rules for a lighter footprint.", traits: ["Light", "Precise", "Quiet"] },
+  { id: "capsule", name: "Capsule", description: "A friendlier pill with the Blueprint gold accent on the result.", traits: ["Friendly", "Rounded", "Warm accent"] },
+  { id: "terminal", name: "Terminal", description: "A dark developer-tool treatment with luminous green values.", traits: ["Developer", "Dark", "Monospace"] },
+  { id: "paper", name: "Paper Label", description: "A warm editorial badge with square archival edges.", traits: ["Editorial", "Warm", "Serif"] },
+  { id: "signal", name: "Signal", description: "High-contrast telemetry with neon value emphasis.", traits: ["Energetic", "Dark", "High contrast"] },
+  { id: "mono", name: "Monochrome", description: "A restrained grayscale badge that fits almost any README.", traits: ["Universal", "Dense", "Neutral"] },
+  { id: "soft", name: "Soft UI", description: "Pale blue surfaces with low visual weight and rounded edges.", traits: ["Gentle", "Modern", "Airy"] },
+  { id: "minimal", name: "Minimal Line", description: "A nearly unfilled badge that lets the numbers do the work.", traits: ["Minimal", "Clean", "Low emphasis"] },
+];
 
 declare global {
   interface Window {
@@ -59,6 +73,22 @@ function DesignGallery() {
     </a>
     <div className="design-card-copy"><span className="design-number">0{index + 1}</span><div><p>{design.direction}</p><h2>{design.name}</h2><p>{design.description}</p><div className="trait-list">{design.traits.map((trait) => <span key={trait}>{trait}</span>)}</div></div></div>
     <div className="design-card-actions"><a href={designPath(design.id)}>Landing</a><a href={designPath(design.id, "report")}>Sample report</a><a href={designPath(design.id, "local")}>Local tools</a></div>
+  </article>)}</section></Shell>;
+}
+
+function BadgeDesignGallery() {
+  return <Shell><section className="badge-gallery-header">
+    <p className="eyebrow">Ten directions · two live values</p>
+    <h1>Choose the badge system.</h1>
+    <p className="lede">Every variant is a production-ready SVG using the same metadata and total token values. The existing Blueprint badge remains the default while you compare them.</p>
+  </section>
+  <section className="badge-design-gallery">{badgeDesigns.map((design, index) => <article className="badge-design-card" key={design.id}>
+    <div className="badge-design-title"><span>{String(index + 1).padStart(2, "0")}</span><div><h2>{design.name}</h2><p>{design.description}</p></div></div>
+    <div className={`badge-preview-surface badge-preview-${design.id}`}>
+      <img src={`/badge/preview/${design.id}/metadata.svg?v=2`} alt={`${design.name} metadata token badge`} />
+      <img src={`/badge/preview/${design.id}/total.svg?v=2`} alt={`${design.name} total token badge`} />
+    </div>
+    <div className="trait-list">{design.traits.map((trait) => <span key={trait}>{trait}</span>)}</div>
   </article>)}</section></Shell>;
 }
 
@@ -200,6 +230,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     badge.searchParams.set("metric", metric);
     badge.searchParams.set("ref", report.repository.commit_sha);
     badge.searchParams.set("encoding", report.method.encoding);
+    badge.searchParams.set("v", report.analyzer_version);
     if (report.repository.subdirectory) badge.searchParams.set("path", report.repository.subdirectory);
     return badge.toString();
   }
@@ -307,6 +338,7 @@ function LocalResult({ result }: { result: SkillsResponse | McpResponse | Contex
 }
 
 export default function App() {
+  if (window.location.pathname === "/badge-designs" || window.location.pathname === "/badge-designs/") return <BadgeDesignGallery />;
   if (window.location.pathname === "/designs" || window.location.pathname === "/designs/") return <DesignGallery />;
   const designMatch = window.location.pathname.match(/^\/designs\/([^/]+)(?:\/(report|local))?\/?$/);
   if (designMatch && isDesignId(designMatch[1])) {

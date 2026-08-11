@@ -14,6 +14,7 @@ class _Entry:
     value: Any
     expires: float
     weight: int
+    group: str | None
 
 
 class AsyncTTLCache:
@@ -36,11 +37,28 @@ class AsyncTTLCache:
             self._entries.move_to_end(key)
             return entry.value
 
-    async def set(self, key: str, value: Any, weight: int = 1) -> None:
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        weight: int = 1,
+        *,
+        group: str | None = None,
+        max_group_entries: int | None = None,
+    ) -> None:
         async with self._lock:
             self._remove(key)
-            self._entries[key] = _Entry(value, time.monotonic() + self.ttl_seconds, weight)
+            self._entries[key] = _Entry(
+                value, time.monotonic() + self.ttl_seconds, weight, group
+            )
             self._weight += weight
+            if group is not None and max_group_entries is not None:
+                grouped = [
+                    entry_key for entry_key, entry in self._entries.items()
+                    if entry.group == group
+                ]
+                for oldest in grouped[:-max_group_entries]:
+                    self._remove(oldest)
             while self._entries and (
                 len(self._entries) > self.max_entries or self._weight > self.max_weight
             ):

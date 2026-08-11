@@ -8,9 +8,12 @@ import io
 import json
 import re
 import tarfile
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO, Iterable
 from urllib.parse import quote, unquote, urlencode, urlparse
 
 import httpx
@@ -60,11 +63,26 @@ class SnapshotAnalysis:
 
 
 @dataclass(frozen=True)
+class BadgeSummary:
+    commit_sha: str
+    metadata_tokens: int
+    total_tokens: int
+    mutable_ref: bool
+
+
+@dataclass(frozen=True)
 class RepositoryLocation:
     owner: str
     repository: str
     ref: str | None = None
     subdirectory: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidatePaths:
+    skill_files: list[str]
+    optional_paths: dict[PurePosixPath, list[str]]
+    selected: set[str]
 
 
 def _stable_id(*parts: str) -> str:
@@ -142,7 +160,10 @@ class GitHubGateway:
         return headers
 
     async def _json(self, path: str) -> dict[str, Any]:
-        timeout = httpx.Timeout(self.settings.repo_timeout_seconds, connect=5.0)
+        timeout = httpx.Timeout(
+            self.settings.repo_timeout_seconds,
+            connect=min(10.0, float(self.settings.repo_timeout_seconds)),
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(
@@ -212,14 +233,18 @@ class GitHubGateway:
             canonical_path=canonical,
         )
 
-    async def archive(self, owner: str, repository: str, sha: str) -> bytes:
+    async def archive(self, owner: str, repository: str, sha: str) -> BinaryIO:
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
+        await self._preflight(owner, repository, sha)
         url = (
             f"{self.settings.github_api_base.rstrip('/')}/repos/{quote(owner)}/"
             f"{quote(repository)}/tarball/{sha.lower()}"
         )
-        timeout = httpx.Timeout(self.settings.repo_timeout_seconds, connect=5.0)
+        timeout = httpx.Timeout(
+            self.settings.repo_timeout_seconds,
+            connect=min(10.0, float(self.settings.repo_timeout_seconds)),
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream("GET", url, headers=self._headers(), follow_redirects=False) as response:
@@ -249,15 +274,101 @@ class GitHubGateway:
         except httpx.HTTPError as error:
             raise ServiceProblem(502, "github_unavailable", "GitHub archive is unavailable") from error
 
-    async def _read_limited(self, response: httpx.Response) -> bytes:
-        chunks: list[bytes] = []
+    async def _preflight(self, owner: str, repository: str, sha: str) -> None:
+        document = await self._json(
+            f"/repos/{quote(owner)}/{quote(repository)}/git/trees/"
+            f"{quote(sha.lower())}?recursive=1"
+        )
+        entries = document.get("tree")
+        if not isinstance(entries, list):
+            raise ServiceProblem(
+                502, "github_invalid_response", "GitHub returned an invalid repository tree"
+            )
+        if document.get("truncated") is True:
+            raise ServiceProblem(
+                413, "repository_tree_too_large",
+                "repository tree exceeds GitHub's recursive listing limit",
+            )
+        if len(entries) + 1 > self.settings.repo_max_members:
+            raise ServiceProblem(
+                413, "too_many_archive_members", "repository archive has too many members"
+            )
+
+        total_bytes = 0
+        paths: dict[str, int] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ServiceProblem(
+                    502, "github_invalid_response",
+                    "GitHub returned an invalid repository tree entry",
+                )
+            if entry.get("type") != "blob":
+                continue
+            path = entry.get("path")
+            size = entry.get("size")
+            if not isinstance(path, str) or not isinstance(size, int) or size < 0:
+                raise ServiceProblem(
+                    502, "github_invalid_response",
+                    "GitHub returned an invalid repository tree entry",
+                )
+            total_bytes += size
+            if total_bytes > self.settings.repo_max_total_bytes:
+                raise ServiceProblem(
+                    413, "repository_too_large",
+                    "repository contents exceed the configured preflight limit",
+                )
+            try:
+                normalized = normalize_relative_path(path)
+            except ValueError:
+                continue
+            if not _EXCLUDED_PARTS.intersection(PurePosixPath(normalized).parts):
+                paths[normalized] = size
+
+        candidates = _static_candidate_paths(paths)
+        if len(candidates.selected) > self.settings.repo_max_relevant_files:
+            raise ServiceProblem(
+                413, "too_many_relevant_files", "repository contains too many relevant files"
+            )
+        candidate_bytes = sum(
+            paths[path]
+            for path in candidates.selected
+            if paths[path] <= self.settings.repo_max_file_bytes
+        )
+        if candidate_bytes > self.settings.repo_max_content_bytes:
+            raise ServiceProblem(
+                413, "relevant_content_too_large",
+                "relevant repository text exceeds the configured limit",
+            )
+
+    async def _read_limited(self, response: httpx.Response) -> BinaryIO:
+        raw_length = response.headers.get("content-length")
+        if raw_length:
+            try:
+                if int(raw_length) > self.settings.repo_archive_max_bytes:
+                    raise ServiceProblem(
+                        413, "archive_too_large",
+                        "repository archive exceeds the configured limit",
+                    )
+            except ValueError:
+                pass
+        output = tempfile.SpooledTemporaryFile(
+            max_size=self.settings.repo_archive_memory_bytes, mode="w+b"
+        )
         total = 0
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
-            if total > self.settings.repo_archive_max_bytes:
-                raise ServiceProblem(413, "archive_too_large", "repository archive exceeds the configured limit")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        try:
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > self.settings.repo_archive_max_bytes:
+                    raise ServiceProblem(
+                        413, "archive_too_large",
+                        "repository archive exceeds the configured limit",
+                    )
+                output.write(chunk)
+            output.seek(0)
+            return output
+        except BaseException:
+            output.close()
+            raise
 
 
 def _detection(path: str) -> tuple[str, list[str], str] | None:
@@ -335,6 +446,33 @@ def _is_optional_skill_text(path: PurePosixPath, root: PurePosixPath) -> bool:
         {"agents", "assets", "scripts"}
     )
     return relative.suffix.lower() in _TEXT_SUFFIXES and not excluded
+
+
+def _static_candidate_paths(paths: Iterable[str]) -> CandidatePaths:
+    """Select candidates using paths alone, before any repository content is read."""
+    skill_files = sorted(
+        path for path in paths if PurePosixPath(path).name == "SKILL.md"
+    )
+    skill_roots = {PurePosixPath(path).parent for path in skill_files}
+    optional_paths: dict[PurePosixPath, list[str]] = {
+        root: [] for root in skill_roots
+    }
+    selected: set[str] = set(skill_files)
+    for path in paths:
+        pure = PurePosixPath(path)
+        if _detection(path):
+            selected.add(path)
+        if pure.name == "SKILL.md":
+            continue
+        root = _nearest_skill_root(pure, skill_roots)
+        if root is not None and _is_optional_skill_text(pure, root):
+            selected.add(path)
+            optional_paths[root].append(path)
+    return CandidatePaths(
+        skill_files=skill_files,
+        optional_paths=optional_paths,
+        selected=selected,
+    )
 
 
 def _frontmatter_metadata(content: str) -> tuple[str | None, str | None]:
@@ -543,15 +681,21 @@ def scope_analysis(
 
 
 def analyze_archive(
-    archive: bytes,
+    archive: bytes | BinaryIO,
     identity: RepositoryIdentity,
     encoding: str,
     settings: Settings,
 ) -> SnapshotAnalysis:
     counter = counter_for(encoding)
     warnings: list[ScanWarning] = []
+    archive_file: BinaryIO
+    if isinstance(archive, bytes):
+        archive_file = io.BytesIO(archive)
+    else:
+        archive.seek(0)
+        archive_file = archive
     try:
-        tar = tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz")
+        tar = tarfile.open(fileobj=archive_file, mode="r:gz")
     except tarfile.TarError as error:
         raise ServiceProblem(502, "invalid_archive", "GitHub returned an invalid tar archive") from error
     with tar:
@@ -589,28 +733,14 @@ def analyze_archive(
                 continue
             normalized_members[path] = member
 
-        skill_files = sorted(
-            path for path in normalized_members if PurePosixPath(path).name == "SKILL.md"
-        )
+        candidates = _static_candidate_paths(normalized_members)
+        skill_files = candidates.skill_files
         catalog_agent_paths = _catalog_agent_paths(
             tar, normalized_members, settings.repo_max_file_bytes
         )
-        skill_roots = {PurePosixPath(path).parent for path in skill_files}
-        optional_paths: dict[PurePosixPath, list[str]] = {
-            root: [] for root in skill_roots
-        }
-        selected: set[str] = set(skill_files)
+        optional_paths = candidates.optional_paths
+        selected = set(candidates.selected)
         selected.update(catalog_agent_paths)
-        for path in normalized_members:
-            pure = PurePosixPath(path)
-            if _detection(path):
-                selected.add(path)
-            if pure.name == "SKILL.md":
-                continue
-            root = _nearest_skill_root(pure, skill_roots)
-            if root is not None and _is_optional_skill_text(pure, root):
-                selected.add(path)
-                optional_paths[root].append(path)
         if len(selected) > settings.repo_max_relevant_files:
             raise ServiceProblem(413, "too_many_relevant_files", "repository contains too many relevant files")
 
@@ -760,18 +890,118 @@ class RepositoryManager:
             settings.report_cache_entries, settings.report_cache_bytes,
             settings.report_cache_ttl_seconds,
         )
+        self.badge_cache = AsyncTTLCache(
+            settings.badge_cache_entries, settings.badge_cache_bytes,
+            settings.badge_cache_ttl_seconds,
+        )
         self.singleflight = SingleFlight()
         self.resolution_cache = AsyncTTLCache(
             max(128, settings.report_cache_entries * 4), 4 * 1024 * 1024, 300,
         )
         self.resolution_singleflight = SingleFlight()
+        self.scan_slots = asyncio.Semaphore(settings.repo_scan_concurrent)
+        self.scan_executor = ThreadPoolExecutor(
+            max_workers=settings.repo_scan_concurrent,
+            thread_name_prefix="repository-scan",
+        )
         self.quota = SlidingQuota()
+
+    def close(self) -> None:
+        self.scan_executor.shutdown(wait=True, cancel_futures=True)
+
+    async def _analyze_in_worker(
+        self,
+        archive: bytes | BinaryIO,
+        identity: RepositoryIdentity,
+        encoding: str,
+    ) -> SnapshotAnalysis:
+        future = self.scan_executor.submit(
+            partial(analyze_archive, archive, identity, encoding, self.settings)
+        )
+        cancelled = False
+        while not future.done():
+            try:
+                await asyncio.sleep(0.025)
+            except asyncio.CancelledError:
+                # Keep the archive valid until its worker has stopped reading it.
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
+        return future.result()
 
     def cache_key(self, identity: RepositoryIdentity, encoding: str) -> str:
         return "|".join((
             identity.owner.lower(), identity.name.lower(), identity.commit_sha.lower(),
             encoding, self.settings.analyzer_version,
         ))
+
+    def badge_cache_key(
+        self, owner: str, repository: str, sha: str,
+        subdirectory: str | None, encoding: str,
+    ) -> str:
+        return "|".join((
+            owner.lower(), repository.lower(), sha.lower(), encoding,
+            subdirectory or "", self.settings.analyzer_version,
+        ))
+
+    async def badge_summary(
+        self, owner: str, repository: str, ref: str | None,
+        subdirectory: str | None, encoding: str | None, ip: str,
+    ) -> BadgeSummary:
+        """Return a compact summary, resolving moving refs before cache lookup."""
+        if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository):
+            raise ServiceProblem(422, "invalid_repository", "invalid GitHub repository")
+        mutable_ref = ref is None or _SHA.fullmatch(ref) is None
+        if mutable_ref:
+            resolved = await self.resolve(
+                RepositoryResolveRequest(
+                    repository=f"{owner}/{repository}", ref=ref,
+                    subdirectory=subdirectory, encoding=encoding,
+                ),
+                ip,
+            )
+            owner = resolved.repository.owner
+            repository = resolved.repository.name
+            sha = resolved.repository.commit_sha
+            normalized_path = resolved.repository.subdirectory
+        else:
+            sha = ref.lower()
+            normalized_path = normalize_subdirectory(subdirectory)
+
+        selected = selected_encoding(encoding, self.settings)
+        key = self.badge_cache_key(
+            owner, repository, sha, normalized_path, selected
+        )
+        cached = await self.badge_cache.get(key)
+        if cached is not None:
+            return BadgeSummary(
+                commit_sha=cached.commit_sha,
+                metadata_tokens=cached.metadata_tokens,
+                total_tokens=cached.total_tokens,
+                mutable_ref=mutable_ref,
+            )
+
+        analysis = await self.get_cached(
+            owner, repository, sha, normalized_path, selected
+        )
+        if analysis is None:
+            analysis = await self.get(
+                owner, repository, sha, normalized_path, selected, ip
+            )
+        summary = BadgeSummary(
+            commit_sha=sha,
+            metadata_tokens=analysis.report.metadata_tokens,
+            total_tokens=analysis.report.category_totals.get("all_discovered_text", 0),
+            mutable_ref=mutable_ref,
+        )
+        group = f"{owner.lower()}|{repository.lower()}"
+        weight = 160 + len(normalized_path or "") + len(selected)
+        await self.badge_cache.set(
+            key, summary, weight,
+            group=group,
+            max_group_entries=self.settings.badge_cache_repo_entries,
+        )
+        return summary
 
     async def resolve(self, request: RepositoryResolveRequest, ip: str) -> RepositoryResolveResponse:
         key = request.model_dump_json()
@@ -828,8 +1058,15 @@ class RepositoryManager:
             if second is not None:
                 return second
             await self._consume_repo_quota(ip)
-            archive = await self.gateway.archive(owner, repository, sha)
-            result = analyze_archive(archive, full_identity, selected, self.settings)
+            async with self.scan_slots:
+                archive = await self.gateway.archive(owner, repository, sha)
+                try:
+                    result = await self._analyze_in_worker(
+                        archive, full_identity, selected
+                    )
+                finally:
+                    if not isinstance(archive, bytes):
+                        archive.close()
             await self.cache.set(key, result, result.weight)
             return result
 
