@@ -1,13 +1,13 @@
 # Agentic Token Estimator
 
-Count prompt-facing tokens across skills, instructions, prompts, agents, and available MCP tool definitions in a public GitHub repository.
+Measure discovery metadata and full agentic content across skills, instructions, prompts, agents, and available MCP tool definitions in a public GitHub repository.
 
-Paste a repository or folder URL to inventory its skills, instructions, rules, prompts, agents, and MCP configuration. The report separates prompt-facing token counts from runtime connection configuration and can be shared as an immutable commit URL.
+Paste a repository or folder URL to inventory its skills, instructions, rules, prompts, agents, and MCP configuration. The report separates lightweight discovery metadata from complete instructions and tool definitions, and it can be shared as an immutable commit URL.
 
 ## What you can do
 
 - Analyze an entire public GitHub repository or one of its folders.
-- See prompt-facing token totals by file, artifact type, and harness.
+- Compare discovery metadata with full content totals by file, artifact type, and harness.
 - Inspect skill instructions and their supporting text separately.
 - Filter reports by path, artifact type, or compatible harness.
 - Count a selected set of components with a configured Claude or Gemini model.
@@ -33,13 +33,21 @@ owner/repository
 
 The application resolves the branch or tag to a commit and opens a report containing:
 
-- total tokens across discovered prompt-facing repository text;
+- discovery metadata tokens across artifact names and descriptions;
+- full content tokens across recognized instructions, supporting text, and tool definitions;
 - an inventory of loadable agentic artifacts;
 - token counts for each artifact and component;
 - the detected harness and loading behavior;
 - scan warnings for skipped or unreadable content.
 
-The headline total is an inventory of discovered prompt-facing text, not a claim that every file is loaded into one prompt at the same time. Runtime MCP connection configuration is excluded.
+Discovery metadata is the compact identity a harness can use to decide whether an artifact is relevant. Full content includes that identity and all recognized instructions, supporting text, or canonical tool-definition fields. It is an inventory, not a claim that every artifact is loaded at the same time. Runtime MCP connection configuration is excluded.
+
+| Artifact | Discovery metadata | Full content |
+| --- | --- | --- |
+| Skill | Name and description | Metadata, instructions, and recognized supporting files |
+| MCP tool | Name and description | Metadata, schemas, title, and standard annotations |
+| Agent | Name and description when declared | Complete agent definition |
+| Rule or prompt | Name and description when declared | Complete file content |
 
 ### Analyze a folder
 
@@ -159,11 +167,11 @@ The repository scanner recognizes common conventions for Codex, Claude Code, Gem
 - `.codex/config.toml`, `.mcp.json`, and supported harness-specific MCP configuration;
 - root-level `mcp-tools.json` snapshots containing generated MCP tool definitions.
 
-MCP connection files are inventoried without treating their raw contents as model context. Reports expose and count only a canonical metadata summary containing each server name and transport. Commands, arguments, URLs, headers, environment variables, and credentials are not returned and do not contribute to prompt-facing totals. Actual MCP tool names, descriptions, and input schemas are counted when supplied through a committed `mcp-tools.json` snapshot or the local MCP workbench; they cannot be inferred from connection configuration without contacting or executing the server.
+MCP connection files are inventoried through a safe summary containing each server name and transport, but that connection summary is not counted as discovery metadata or full content. Commands, arguments, URLs, headers, environment variables, and credentials are not returned. Actual MCP tool names, descriptions, schemas, and supported definition details are counted when supplied through a committed `mcp-tools.json` snapshot or the local MCP workbench; they cannot be inferred from connection configuration without contacting or executing the server.
 
 ### Publish MCP tool definitions safely
 
-MCP server maintainers are encouraged to generate and commit a root-level `mcp-tools.json`. This project-specific snapshot lets repository reports include the server's LLM-facing tool definitions without installing dependencies, executing repository code, contacting the server, or invoking a tool. MCP itself does not standardize this repository file.
+MCP server maintainers are encouraged to generate and commit a root-level `mcp-tools.json`. This project-specific snapshot lets repository reports include the server's declared tool definitions without installing dependencies, executing repository code, contacting the server, or invoking a tool. MCP itself does not standardize this repository file.
 
 ```json
 {
@@ -184,7 +192,14 @@ MCP server maintainers are encouraged to generate and commit a root-level `mcp-t
           "query": { "type": "string" }
         },
         "required": ["query"]
-      }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "matches": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "annotations": { "readOnlyHint": true }
     }
   ]
 }
@@ -192,7 +207,9 @@ MCP server maintainers are encouraged to generate and commit a root-level `mcp-t
 
 The snapshot requires `format`, `formatVersion`, `server.name`, and `tools`; every tool requires a unique `name` and an object `inputSchema`. Copy the complete, sanitized result of all paginated `tools/list` responses into `tools`, preserving standard fields such as `title`, `description`, `outputSchema`, `annotations`, and `icons` when present. Do not commit the JSON-RPC envelope, cursors, `_meta`, credentials, runtime arguments, or tool results. Regenerate the snapshot in trusted local development or CI whenever tool definitions change.
 
-Repository reports count a canonical definition containing each tool's name, description, and input schema. Each MCP tool card also shows the token counts for those three parts alongside the full canonical definition count. The parts explain where the definition's tokens come from but are not additive because the full JSON definition includes field names and serialization punctuation. When a supported MCP SDK dependency is detected but no valid snapshot exists, the report warns that MCP context is excluded because the service does not execute the server or call `tools/list`.
+Repository reports treat each tool's name and description as discovery metadata. Its canonical full definition contains the name, description, input schema, and—when present—the title, output schema, and standard MCP annotations. Examples and descriptions nested inside those schemas are therefore included. Icons, `_meta`, arbitrary extension fields, runtime results, and server connection details remain excluded.
+
+Each MCP tool card shows discovery metadata, input schema, output and detail fields, and the full canonical definition. The explanatory parts are not additive because the full JSON definition also contains field names and serialization punctuation. When a supported MCP SDK dependency is detected but no valid snapshot exists, the report warns that the definitions cannot be estimated because the service does not execute the server or call `tools/list`.
 
 ## Caching and limits
 

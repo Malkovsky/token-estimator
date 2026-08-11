@@ -101,14 +101,20 @@ def estimate_mcp(request: McpRequest, settings: Settings) -> McpResponse:
                 id=f"{document_index}:{tool_index}:{usage.name}", source=item.source,
                 name=usage.name, encoding=encoding, description=usage.description,
                 schema_tokens=usage.schema, definition=usage.definition,
+                name_tokens=usage.name_tokens, discovery_tokens=usage.discovery,
+                output_schema_tokens=usage.output_schema,
+                details_tokens=usage.details,
             ))
             if len(records) > settings.max_tools:
                 raise ValueError(f"too many MCP tools; maximum is {settings.max_tools}")
     return McpResponse(
         method=method_info(encoding), records=records,
         totals={
+            "discovery": sum(item.discovery_tokens for item in records),
             "description": sum(item.description for item in records),
             "schema": sum(item.schema_tokens for item in records),
+            "output_schema": sum(item.output_schema_tokens for item in records),
+            "details": sum(item.details_tokens for item in records),
             "definition": sum(item.definition for item in records),
         },
     )

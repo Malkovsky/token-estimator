@@ -11,7 +11,8 @@ export type InventoryItem = {
   characters: number | null; tokens: number | null; components: InventoryComponent[];
   mcp_servers: { name: string; transport: string }[];
   mcp_tool_breakdown: {
-    name: number; description: number; input_schema: number; definition: number;
+    name: number; description: number; discovery: number; input_schema: number;
+    output_schema: number; details: number; definition: number;
   } | null;
   accounting_note: string | null;
 };
@@ -37,7 +38,9 @@ export type SkillRecord = {
 };
 export type McpRecord = {
   id: string; source: string; name: string; encoding: string;
-  description: number; schema_tokens: number; definition: number;
+  name_tokens: number; description: number; discovery_tokens: number;
+  schema_tokens: number; output_schema_tokens: number; details_tokens: number;
+  definition: number;
 };
 export type ContextRecord = {
   id: string; source: string; encoding: string; characters: number; tokens: number;

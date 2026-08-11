@@ -24,7 +24,7 @@ import json5
 import yaml
 
 from token_estimator import (
-    compact_json, frontmatter_identity, normalize_relative_path, normalize_tool,
+    canonicalize_tool, compact_json, frontmatter_identity, normalize_relative_path,
     split_frontmatter,
 )
 
@@ -1080,35 +1080,47 @@ def _mcp_snapshot_inventory(
             raise ValueError("every tool must be a JSON object")
         if not isinstance(raw_tool.get("inputSchema"), dict):
             raise ValueError("every tool must contain an object inputSchema")
-        name, description, schema = normalize_tool(raw_tool)
-        if name in names:
-            raise ValueError(f"duplicate tool name {name!r}")
-        names.add(name)
-        schema_text = compact_json(schema)
-        definition = compact_json({
-            "name": name, "description": description, "inputSchema": schema,
-        })
-        item_path = f"{_MCP_TOOLS_SNAPSHOT}#{name}"
-        component_id = _stable_id(_MCP_TOOLS_SNAPSHOT, "mcp_tool", name, "definition")
+        tool = canonicalize_tool(raw_tool)
+        if tool.name in names:
+            raise ValueError(f"duplicate tool name {tool.name!r}")
+        names.add(tool.name)
+        schema_text = compact_json(tool.input_schema)
+        output_schema_text = (
+            compact_json(tool.output_schema) if tool.output_schema is not None else ""
+        )
+        details_text = compact_json(tool.details) if tool.details else ""
+        definition = compact_json(tool.definition)
+        name_tokens = counter(tool.name)
+        description_tokens = counter(tool.description)
+        item_path = f"{_MCP_TOOLS_SNAPSHOT}#{tool.name}"
+        component_id = _stable_id(
+            _MCP_TOOLS_SNAPSHOT, "mcp_tool", tool.name, "definition"
+        )
         component = InventoryComponent(
             id=component_id, path=item_path, role="definition", load_policy="discovery",
             characters=len(definition), tokens=counter(definition),
         )
         contents[component_id] = definition
         inventory.append(InventoryItem(
-            id=_stable_id(_MCP_TOOLS_SNAPSHOT, "mcp_tool", name),
-            path=item_path, kind="mcp_tool", name=name,
-            description=description or None, harnesses=["mcp"],
+            id=_stable_id(_MCP_TOOLS_SNAPSHOT, "mcp_tool", tool.name),
+            path=item_path, kind="mcp_tool", name=tool.name,
+            description=tool.description or None, harnesses=["mcp"],
             load_policy="discovery", characters=component.characters,
             tokens=component.tokens, components=[component],
             mcp_tool_breakdown=McpToolBreakdown(
-                name=counter(name), description=counter(description),
-                input_schema=counter(schema_text), definition=component.tokens,
+                name=name_tokens,
+                description=description_tokens,
+                discovery=name_tokens + description_tokens,
+                input_schema=counter(schema_text),
+                output_schema=(counter(output_schema_text) if output_schema_text else 0),
+                details=counter(details_text) if details_text else 0,
+                definition=component.tokens,
             ),
             accounting_note=(
                 f"Generated tools/list snapshot for {server_name}. The full definition "
-                "is counted as one JSON object; breakdown values are explanatory and "
-                "non-additive. Runtime tool results and server instructions are excluded."
+                "includes discovery metadata, input and output schemas, title, and standard "
+                "annotations when present. Breakdown values are explanatory and non-additive; "
+                "icons, _meta, arbitrary extensions, and runtime tool results are excluded."
             ),
         ))
     return inventory, contents
@@ -1128,12 +1140,14 @@ def _aggregate_warnings(warnings: list[ScanWarning]) -> list[ScanWarning]:
     return list(grouped.values())
 
 
-def _metadata_token_total(
+def _discovery_token_total(
     inventory: list[InventoryItem], counter: Any,
 ) -> int:
-    """Count discovery identity without double-counting skill metadata."""
+    """Count names and descriptions used to discover loadable artifacts."""
     total = 0
     for item in inventory:
+        if item.kind == "mcp_config":
+            continue
         explicit = [component.tokens for component in item.components if component.role == "metadata"]
         if explicit:
             total += sum(explicit)
@@ -1200,7 +1214,7 @@ def scope_analysis(
     report = analysis.report.model_copy(update={
         "repository": repository,
         "inventory": inventory,
-        "metadata_tokens": _metadata_token_total(
+        "metadata_tokens": _discovery_token_total(
             inventory, counter_for(analysis.report.method.encoding)
         ),
         "category_totals": totals,
@@ -1431,7 +1445,7 @@ def analyze_archive(
                 id=_stable_id(path, kind), path=path, kind=kind, harnesses=harnesses,
                 load_policy=policy, components=components, mcp_servers=servers,
                 accounting_note=(
-                    "Connection configuration is excluded from prompt totals; "
+                    "Connection configuration is excluded from full content totals; "
                     "tool schemas are unavailable without contacting the server."
                 ),
             ))
@@ -1466,7 +1480,7 @@ def analyze_archive(
     totals["all_discovered_text"] = sum(totals.values())
     report = RepositoryReport(
         repository=identity, method=method_info(encoding), analyzer_version=settings.analyzer_version,
-        inventory=inventory, metadata_tokens=_metadata_token_total(inventory, counter),
+        inventory=inventory, metadata_tokens=_discovery_token_total(inventory, counter),
         category_totals=totals,
         warnings=_aggregate_warnings(warnings),
         scan=ScanStats(
@@ -1508,13 +1522,29 @@ def retokenize_analysis(
             ), "")
             try:
                 document = json.loads(definition)
-                schema = document.get("inputSchema", {}) if isinstance(document, dict) else {}
+                if isinstance(document, dict):
+                    schema = document.get("inputSchema", {})
+                    output_schema = document.get("outputSchema")
+                    details = {
+                        key: document[key] for key in ("title", "annotations")
+                        if key in document
+                    }
+                else:
+                    schema, output_schema, details = {}, None, {}
             except json.JSONDecodeError:
-                schema = {}
+                schema, output_schema, details = {}, None, {}
+            name_tokens = counter(item.name or "")
+            description_tokens = counter(item.description or "")
             mcp_tool_breakdown = McpToolBreakdown(
-                name=counter(item.name or ""),
-                description=counter(item.description or ""),
+                name=name_tokens,
+                description=description_tokens,
+                discovery=name_tokens + description_tokens,
                 input_schema=counter(compact_json(schema)),
+                output_schema=(
+                    counter(compact_json(output_schema))
+                    if isinstance(output_schema, dict) else 0
+                ),
+                details=counter(compact_json(details)) if details else 0,
                 definition=counter(definition),
             )
         inventory.append(item.model_copy(update={
@@ -1531,7 +1561,7 @@ def retokenize_analysis(
     report = analysis.report.model_copy(update={
         "method": method_info(encoding),
         "inventory": inventory,
-        "metadata_tokens": _metadata_token_total(inventory, counter),
+        "metadata_tokens": _discovery_token_total(inventory, counter),
         "category_totals": totals,
         "cached": False,
     })

@@ -178,9 +178,9 @@ function InventoryCard({ item, selected, toggle }: { item: InventoryItem; select
   return <article className="inventory-card">
     <div className="inventory-heading"><div><div className="badges"><span>{title(item.kind)}</span>{item.harnesses.map((harness) => <span key={harness} className="muted-badge">{title(harness)}</span>)}</div><h3>{item.path}</h3>{item.description && <p className="metadata-description">{item.description}</p>}</div><strong>{number(item.tokens)} <small>tokens</small></strong></div>
     {item.mcp_tool_breakdown && <div className="mcp-breakdown">
-      <span><small>Name</small><strong>{number(item.mcp_tool_breakdown.name)}</strong></span>
-      <span><small>Description</small><strong>{number(item.mcp_tool_breakdown.description)}</strong></span>
+      <span className="discovery-total"><small>Discovery metadata</small><strong>{number(item.mcp_tool_breakdown.discovery)}</strong><em>Name {number(item.mcp_tool_breakdown.name)} · description {number(item.mcp_tool_breakdown.description)}</em></span>
       <span><small>Input schema</small><strong>{number(item.mcp_tool_breakdown.input_schema)}</strong></span>
+      <span><small>Output + details</small><strong>{number(item.mcp_tool_breakdown.output_schema + item.mcp_tool_breakdown.details)}</strong><em>Output {number(item.mcp_tool_breakdown.output_schema)} · details {number(item.mcp_tool_breakdown.details)}</em></span>
       <span className="definition-total"><small>Full definition</small><strong>{number(item.mcp_tool_breakdown.definition)}</strong></span>
     </div>}
     {item.components.length > 0 && <div className="components">{item.components.map((component) => <label key={component.id}>
@@ -329,7 +329,8 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     <div className="header-actions"><a href={report.repository.html_url} target="_blank" rel="noreferrer">View on GitHub</a><button className="secondary-button" onClick={() => navigator.clipboard.writeText(window.location.href)}>Copy report link</button></div>
   </section>
   <section className="metrics">
-    <div><span>Prompt-facing text</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>baseline tokens</small></div>
+    <div><span>Full content</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>all recognized tokens</small></div>
+    <div><span>Discovery metadata</span><strong>{number(report.metadata_tokens)}</strong><small>names + descriptions</small></div>
     <div><span>Inventory</span><strong>{number(report.inventory.length)}</strong><small>loadable artifacts</small></div>
     <div><span>Relevant files</span><strong>{number(report.scan.relevant_files)}</strong><small>{number(report.scan.relevant_bytes)} bytes</small></div>
     <div><span>Tokenizer</span><strong>{report.method.encoding}</strong><small>tiktoken {report.method.version}</small></div>
@@ -342,7 +343,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
       <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
     </div>)}
   </section>
-  <p className="inventory-note">Totals sum discovered prompt-facing repository text. Runtime configuration and MCP connection secrets are excluded, and the result is not an estimate of one simultaneously active harness prompt.</p>
+  <p className="inventory-note">Discovery metadata counts artifact names and descriptions. Full content includes all recognized instructions, supporting text, and canonical tool definitions; it is an inventory, not an estimate of one simultaneously active prompt. Runtime connection configuration and secrets are excluded.</p>
   <section className="report-grid"><div>
     <div className="filters"><input aria-label="Filter paths" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter paths…" /><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">All kinds</option>{kinds.map((value) => <option key={value}>{value}</option>)}</select><select value={harness} onChange={(event) => setHarness(event.target.value)}><option value="all">All harnesses</option>{harnesses.map((value) => <option key={value}>{value}</option>)}</select></div>
     <div className="inventory-list">{filtered.map((item) => <InventoryCard key={item.id} item={item} selected={selected} toggle={toggle} />)}{filtered.length === 0 && <p className="empty">No matching harness artifacts.</p>}</div>
@@ -412,7 +413,11 @@ function LocalResult({ result }: { result: SkillsResponse | McpResponse | Contex
   if (!result) return <div className="empty-state"><h2>No result yet</h2><p>Run an estimate to see its token breakdown.</p></div>;
   if (result.mode === "scenario") return <><div className="native-result"><strong>{number(result.total_tokens)}</strong><span>scenario tokens</span></div>{Object.entries(result.breakdown).map(([key, value]) => <div className="result-line" key={key}><span>{title(key)}</span><b>{number(value)}</b></div>)}</>;
   const total = result.mode === "skills" ? Object.values(result.totals).reduce((a, b) => a + b, 0) : result.mode === "mcp" ? result.totals.definition : result.totals.tokens;
-  return <><div className="native-result"><strong>{number(total)}</strong><span>{result.mode} tokens</span></div>{result.records.map((record) => <div className="result-line" key={record.id}><span>{"name" in record ? record.name : record.source}<small>{record.source}</small></span><b>{number("body" in record ? record.metadata + record.body + record.optional : "definition" in record ? record.definition : record.tokens)}</b></div>)}</>;
+  return <><div className="native-result"><strong>{number(total)}</strong><span>full {result.mode} content</span></div>{result.records.map((record) => {
+    const full = "body" in record ? record.metadata + record.body + record.optional : "definition" in record ? record.definition : record.tokens;
+    const discovery = "body" in record ? record.metadata : "definition" in record ? record.discovery_tokens : null;
+    return <div className="result-line" key={record.id}><span>{"name" in record ? record.name : record.source}<small>{record.source}{discovery !== null && <> · discovery {number(discovery)}</>}</small></span><b>{number(full)}</b></div>;
+  })}</>;
 }
 
 export default function App() {

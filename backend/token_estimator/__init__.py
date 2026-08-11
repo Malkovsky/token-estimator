@@ -1,12 +1,14 @@
 """Reusable token-accounting primitives for the web application."""
 
 from .core import (
+    CanonicalMcpTool,
     ContextUsage,
     McpUsage,
     OptionalFileUsage,
     SkillDetail,
     SkillUsage,
     TextSource,
+    canonicalize_tool,
     compact_json,
     frontmatter_identity,
     make_counter,
@@ -19,12 +21,14 @@ from .core import (
 )
 
 __all__ = [
+    "CanonicalMcpTool",
     "ContextUsage",
     "McpUsage",
     "OptionalFileUsage",
     "SkillDetail",
     "SkillUsage",
     "TextSource",
+    "canonicalize_tool",
     "compact_json",
     "frontmatter_identity",
     "make_counter",

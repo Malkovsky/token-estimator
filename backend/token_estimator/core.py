@@ -45,9 +45,23 @@ class SkillDetail:
 @dataclass(frozen=True)
 class McpUsage:
     name: str
+    name_tokens: int
     description: int
+    discovery: int
     schema: int
+    output_schema: int
+    details: int
     definition: int
+
+
+@dataclass(frozen=True)
+class CanonicalMcpTool:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+    details: dict[str, Any]
+    definition: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -224,6 +238,68 @@ def normalize_tool(tool: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     return name, description, schema
 
 
+def canonicalize_tool(tool: dict[str, Any]) -> CanonicalMcpTool:
+    """Select the standard, text-bearing MCP fields used for full definitions."""
+    if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+        tool = tool["function"]
+    name, description, input_schema = normalize_tool(tool)
+    definition: dict[str, Any] = {
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+    }
+    details: dict[str, Any] = {}
+
+    if "title" in tool:
+        title = tool["title"]
+        if not isinstance(title, str):
+            raise ValueError(f"MCP tool {name!r} has a non-string title")
+        definition["title"] = title
+        details["title"] = title
+
+    output_schema: dict[str, Any] | None = None
+    if "outputSchema" in tool:
+        raw_output_schema = tool["outputSchema"]
+        if not isinstance(raw_output_schema, dict):
+            raise ValueError(f"MCP tool {name!r} has a non-object output schema")
+        output_schema = raw_output_schema
+        definition["outputSchema"] = output_schema
+
+    if "annotations" in tool:
+        raw_annotations = tool["annotations"]
+        if not isinstance(raw_annotations, dict):
+            raise ValueError(f"MCP tool {name!r} has non-object annotations")
+        annotations: dict[str, Any] = {}
+        annotation_types: dict[str, type[Any]] = {
+            "title": str,
+            "readOnlyHint": bool,
+            "destructiveHint": bool,
+            "idempotentHint": bool,
+            "openWorldHint": bool,
+        }
+        for key, expected_type in annotation_types.items():
+            if key not in raw_annotations:
+                continue
+            value = raw_annotations[key]
+            if not isinstance(value, expected_type):
+                raise ValueError(
+                    f"MCP tool {name!r} annotation {key!r} has an invalid type"
+                )
+            annotations[key] = value
+        if annotations:
+            definition["annotations"] = annotations
+            details["annotations"] = annotations
+
+    return CanonicalMcpTool(
+        name=name,
+        description=description,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        details=details,
+        definition=definition,
+    )
+
+
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -237,14 +313,22 @@ def measure_mcp_documents(
         if not tools:
             raise ValueError(f"{source}: no MCP tool definitions found")
         for raw_tool in tools:
-            name, description, schema = normalize_tool(raw_tool)
-            definition = {"name": name, "description": description, "inputSchema": schema}
+            tool = canonicalize_tool(raw_tool)
+            name_tokens = count(tool.name)
+            description_tokens = count(tool.description)
             usages.append(
                 McpUsage(
-                    name=name,
-                    description=count(description),
-                    schema=count(compact_json(schema)),
-                    definition=count(compact_json(definition)),
+                    name=tool.name,
+                    name_tokens=name_tokens,
+                    description=description_tokens,
+                    discovery=name_tokens + description_tokens,
+                    schema=count(compact_json(tool.input_schema)),
+                    output_schema=(
+                        count(compact_json(tool.output_schema))
+                        if tool.output_schema is not None else 0
+                    ),
+                    details=count(compact_json(tool.details)) if tool.details else 0,
+                    definition=count(compact_json(tool.definition)),
                 )
             )
     return usages

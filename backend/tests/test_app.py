@@ -138,9 +138,22 @@ def test_legacy_skill_mcp_and_scenario() -> None:
     mcp = request(
         "POST", "/api/v1/estimates/mcp",
         json={"documents": [{"source": "tools.json", "document": {
-            "tools": [{"name": "search", "description": "Search", "inputSchema": {"type": "object"}}]
+            "tools": [{
+                "name": "search", "description": "Search",
+                "inputSchema": {"type": "object"},
+                "outputSchema": {"type": "object"},
+                "title": "Search tool",
+            }]
         }}]},
     ).json()
+    mcp_record = mcp["records"][0]
+    assert mcp_record["discovery_tokens"] == (
+        mcp_record["name_tokens"] + mcp_record["description"]
+    )
+    assert mcp_record["output_schema_tokens"] > 0
+    assert mcp_record["details_tokens"] > 0
+    assert mcp["totals"]["discovery"] == mcp_record["discovery_tokens"]
+    assert mcp["totals"]["definition"] == mcp_record["definition"]
     scenario = request(
         "POST", "/api/v1/scenarios/estimate",
         json={
@@ -270,6 +283,10 @@ def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> Non
     assert "remote\thttp" in safe_mcp_metadata
     assert "secret" not in safe_mcp_metadata
     assert "mcp_config" not in result.report.category_totals
+    counter = counter_for("o200k_base")
+    assert result.report.metadata_tokens == (
+        counter("demo") + counter("Demonstrate a compact workflow.")
+    )
     serialized = result.report.model_dump_json()
     assert "secret-command" not in serialized
     assert "https://secret" not in serialized
@@ -298,7 +315,10 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
                 "required": ["query"],
             },
             "outputSchema": {"type": "object"},
-            "annotations": {"readOnlyHint": True},
+            "annotations": {"readOnlyHint": True, "customHint": "excluded"},
+            "icons": [{"src": "data:image/png;base64,excluded"}],
+            "_meta": {"secret": "excluded"},
+            "extensionField": "excluded",
         }],
     }
     result = analyze_archive(archive({
@@ -321,11 +341,21 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
         snapshot["tools"][0]["inputSchema"], ensure_ascii=False,
         separators=(",", ":"), sort_keys=True,
     )
+    output_schema_text = json.dumps(
+        snapshot["tools"][0]["outputSchema"], ensure_ascii=False,
+        separators=(",", ":"), sort_keys=True,
+    )
+    details_text = json.dumps({
+        "title": "Search", "annotations": {"readOnlyHint": True},
+    }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     assert breakdown.name == counter("search")
     assert breakdown.description == counter("Search indexed symbols.")
+    assert breakdown.discovery == breakdown.name + breakdown.description
     assert breakdown.input_schema == counter(schema_text)
+    assert breakdown.output_schema == counter(output_schema_text)
+    assert breakdown.details == counter(details_text)
     assert breakdown.definition == tool.tokens
-    assert result.report.metadata_tokens == breakdown.name + breakdown.description
+    assert result.report.metadata_tokens == breakdown.discovery
     assert result.report.category_totals["mcp_tool"] == tool.tokens
     assert result.report.category_totals["all_discovered_text"] == tool.tokens
     assert result.report.scan.relevant_files == 1
@@ -333,7 +363,13 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
     definition = result.contents[tool.components[0].id]
     assert '"name":"search"' in definition
     assert '"inputSchema"' in definition
-    assert "outputSchema" not in definition
+    assert '"outputSchema"' in definition
+    assert '"title":"Search"' in definition
+    assert '"readOnlyHint":true' in definition
+    assert "customHint" not in definition
+    assert "icons" not in definition
+    assert "_meta" not in definition
+    assert "extensionField" not in definition
 
     retokenized = retokenize_analysis(result, "cl100k_base")
     retokenized_tool = retokenized.report.inventory[0]
@@ -342,10 +378,15 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
     cl100k = counter_for("cl100k_base")
     assert retokenized_breakdown.name == cl100k("search")
     assert retokenized_breakdown.description == cl100k("Search indexed symbols.")
+    assert retokenized_breakdown.discovery == (
+        retokenized_breakdown.name + retokenized_breakdown.description
+    )
     assert retokenized_breakdown.input_schema == cl100k(schema_text)
+    assert retokenized_breakdown.output_schema == cl100k(output_schema_text)
+    assert retokenized_breakdown.details == cl100k(details_text)
     assert retokenized_breakdown.definition == retokenized_tool.tokens
     assert retokenized.report.metadata_tokens == (
-        retokenized_breakdown.name + retokenized_breakdown.description
+        retokenized_breakdown.discovery
     )
 
 
