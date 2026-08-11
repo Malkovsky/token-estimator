@@ -17,10 +17,12 @@ from token_estimator_web.config import Settings
 from token_estimator_web.main import app, repositories
 from token_estimator_web.providers import NativeCountManager
 from token_estimator_web.errors import ServiceProblem
-from token_estimator_web.repository import GitHubGateway, RepositoryManager, analyze_archive, parse_repository
+from token_estimator_web.repository import (
+    GitHubGateway, RepositoryManager, analyze_archive, parse_repository,
+)
 from token_estimator_web.schemas import (
     NativeCountRequest, NativeSnapshot, RepositoryIdentity, RepositoryResolveRequest,
-    RepositoryResolveResponse,
+    RepositoryResolveResponse, ScanWarning,
 )
 
 
@@ -484,6 +486,71 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(repositories, "get", unexpected_get)
     conditional = request("GET", path, headers={"if-none-match": first.headers["etag"]})
     assert conditional.status_code == 304
+
+
+def test_repository_discovery_is_reused_across_encodings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(Settings.from_env(), quotas_enabled=False, repo_fetch_mode="archive")
+    manager = RepositoryManager(settings)
+    payload = archive({"SKILL.md": SKILL.encode(), "AGENTS.md": b"Keep changes small."})
+    calls = 0
+
+    async def fake_archive(_: str, __: str, ___: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        return payload
+
+    async def public_metadata(owner: str, repository: str) -> dict[str, object]:
+        return {
+            "private": False, "visibility": "public", "name": repository,
+            "owner": {"login": owner},
+        }
+
+    monkeypatch.setattr(manager.gateway, "archive", fake_archive)
+    monkeypatch.setattr(manager.gateway, "public_metadata", public_metadata)
+    sha = "9" * 40
+    try:
+        first = asyncio.run(manager.get(
+            "cache-test", "fixture", sha, None, "o200k_base", "127.0.0.1"
+        ))
+        derived = asyncio.run(manager.get(
+            "cache-test", "fixture", sha, None, "cl100k_base", "127.0.0.1"
+        ))
+        cached = asyncio.run(manager.get(
+            "cache-test", "fixture", sha, None, "cl100k_base", "127.0.0.1"
+        ))
+        identity = RepositoryIdentity(
+            owner="cache-test", name="fixture", commit_sha=sha,
+            html_url=f"https://github.com/cache-test/fixture/tree/{sha}",
+        )
+        direct = analyze_archive(payload, identity, "cl100k_base", settings)
+        assert calls == 1
+        assert first.report.method.encoding == "o200k_base"
+        assert derived.report.method.encoding == "cl100k_base"
+        assert derived.report.category_totals == direct.report.category_totals
+        assert derived.report.metadata_tokens == direct.report.metadata_tokens
+        assert derived.report.cached is False
+        assert cached.report.cached is True
+    finally:
+        manager.close()
+
+
+def test_selected_snapshot_preserves_full_tree_scan_stats() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="acme", name="fixture", commit_sha="8" * 40,
+        html_url=f"https://github.com/acme/fixture/tree/{'8' * 40}",
+    )
+    warning = ScanWarning(
+        code="file_too_large", message="Skipped oversized text file", path="large/SKILL.md"
+    )
+    result = analyze_archive(
+        archive({"SKILL.md": SKILL.encode()}), identity, "o200k_base", settings,
+        archive_member_count=4321, initial_warnings=[warning],
+    )
+    assert result.report.scan.archive_members == 4321
+    assert result.report.warnings[0].code == "file_too_large"
 
 
 def test_direct_snapshot_rejects_private_repository(

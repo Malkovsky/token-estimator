@@ -47,6 +47,7 @@ class Settings:
     proxy_mode: str
     github_token: str
     github_api_base: str
+    repo_fetch_mode: str
     repo_timeout_seconds: int
     repo_archive_max_bytes: int
     repo_archive_memory_bytes: int
@@ -80,7 +81,7 @@ class Settings:
     turnstile_secret_key: str
     turnstile_expected_hostname: str
     turnstile_required: bool
-    analyzer_version: str = "repo-inventory-v8"
+    analyzer_version: str = "repo-inventory-v9"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +89,11 @@ class Settings:
         proxy_mode = os.getenv("TOKEN_ESTIMATOR_PROXY_MODE", "direct")
         if proxy_mode not in {"direct", "render"}:
             raise RuntimeError("TOKEN_ESTIMATOR_PROXY_MODE must be direct or render")
+        repo_fetch_mode = os.getenv("TOKEN_ESTIMATOR_REPO_FETCH_MODE", "auto").lower()
+        if repo_fetch_mode not in {"auto", "git", "archive"}:
+            raise RuntimeError(
+                "TOKEN_ESTIMATOR_REPO_FETCH_MODE must be auto, git, or archive"
+            )
         required = os.getenv("TOKEN_ESTIMATOR_TURNSTILE_REQUIRED", "true").lower() not in {
             "0", "false", "no"
         }
@@ -111,6 +117,7 @@ class Settings:
             proxy_mode=proxy_mode,
             github_token=os.getenv("GITHUB_TOKEN", ""),
             github_api_base=os.getenv("TOKEN_ESTIMATOR_GITHUB_API", "https://api.github.com"),
+            repo_fetch_mode=repo_fetch_mode,
             repo_timeout_seconds=_positive_int("TOKEN_ESTIMATOR_REPO_TIMEOUT_SECONDS", 120),
             repo_archive_max_bytes=_positive_int(
                 "TOKEN_ESTIMATOR_REPO_ARCHIVE_MAX_BYTES", 100 * 1024 * 1024

@@ -13,6 +13,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.lock /tmp/requirements.lock
 RUN python -m pip install --no-cache-dir --requirement /tmp/requirements.lock
 

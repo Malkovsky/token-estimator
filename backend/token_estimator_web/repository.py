@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import re
+import shutil
 import tarfile
 import tempfile
 from contextlib import asynccontextmanager
@@ -14,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import PurePosixPath
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, TypeVar
 from urllib.parse import quote, unquote, urlencode, urlparse
 
 import httpx
@@ -46,6 +48,7 @@ _EXCLUDED_PARTS = {
     ".git", ".hg", ".svn", ".venv", "node_modules", "vendor", "dist",
     "build", "target", ".cache", "__pycache__",
 }
+_T = TypeVar("_T")
 
 
 def _retry_after(value: str | None, default: int = 60) -> int:
@@ -55,12 +58,55 @@ def _retry_after(value: str | None, default: int = 60) -> int:
         return default
 
 
+def _sparse_checkout_input(paths: Iterable[str]) -> bytes:
+    """Build root-anchored, literal no-cone sparse-checkout patterns."""
+    patterns: list[str] = []
+    for path in sorted(paths):
+        escaped = path.replace("\\", "\\\\")
+        for character in ("*", "?", "[", "]"):
+            escaped = escaped.replace(character, f"\\{character}")
+        patterns.append(f"/{escaped}")
+    return (("\n".join(patterns) + "\n") if patterns else "").encode()
+
+
 @dataclass(frozen=True)
 class SnapshotAnalysis:
     report: RepositoryReport
     contents: dict[str, str]
     file_bytes: dict[str, int]
     weight: int
+
+
+@dataclass
+class CachedRepository:
+    """One discovered repository snapshot with one or more token encodings."""
+
+    analyses: dict[str, SnapshotAnalysis]
+
+    @property
+    def weight(self) -> int:
+        if not self.analyses:
+            return 0
+        first = next(iter(self.analyses.values()))
+        return sum(first.file_bytes.values()) + sum(
+            len(analysis.report.model_dump_json())
+            for analysis in self.analyses.values()
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotSource:
+    archive: BinaryIO
+    archive_members: int
+    warnings: tuple[ScanWarning, ...] = ()
+
+
+@dataclass(frozen=True)
+class GitTreeEntry:
+    path: str
+    oid: str
+    mode: str
+    size: int
 
 
 @dataclass(frozen=True)
@@ -245,10 +291,212 @@ class GitHubGateway:
             canonical_path=canonical,
         )
 
-    async def archive(self, owner: str, repository: str, sha: str) -> BinaryIO:
+    async def archive(
+        self, owner: str, repository: str, sha: str,
+    ) -> BinaryIO | SnapshotSource:
+        """Fetch a bounded snapshot, preferring Git's partial-clone protocol."""
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
-        await self._preflight(owner, repository, sha)
+        mode = self.settings.repo_fetch_mode
+        if mode == "archive":
+            return await self._archive_download(owner, repository, sha)
+        entries, member_count = await self._preflight(owner, repository, sha.lower())
+        try:
+            return await self._git_snapshot(
+                owner, repository, sha.lower(), entries, member_count
+            )
+        except ServiceProblem as error:
+            if mode == "git" or error.status not in {502, 503}:
+                raise
+        return await self._archive_download(
+            owner, repository, sha, preflight=False
+        )
+
+    async def _run_git(
+        self, directory: str, *arguments: str, input_bytes: bytes | None = None,
+    ) -> bytes:
+        git = shutil.which("git")
+        if git is None:
+            raise ServiceProblem(502, "git_unavailable", "Git is not installed")
+        environment = os.environ.copy()
+        environment.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        })
+        configuration = (
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "protocol.file.allow=never",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.autocrlf=false",
+            "-c", "filter.lfs.required=false",
+            "-c", "filter.lfs.smudge=",
+            "-c", "filter.lfs.clean=",
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                git, *configuration, *arguments,
+                cwd=directory, env=environment,
+                stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as error:
+            raise ServiceProblem(502, "git_unavailable", "Git could not be started") from error
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input_bytes), self.settings.repo_timeout_seconds
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            process.kill()
+            await process.wait()
+            if asyncio.current_task() and asyncio.current_task().cancelling():
+                raise
+            raise ServiceProblem(503, "git_timeout", "GitHub Git request timed out")
+        if process.returncode != 0:
+            detail = stderr[-1000:].decode("utf-8", errors="replace").strip()
+            if "not our ref" in detail or "couldn't find remote ref" in detail:
+                raise ServiceProblem(404, "snapshot_not_found", "repository snapshot was not found")
+            raise ServiceProblem(502, "git_fetch_failed", "GitHub Git request failed")
+        return stdout
+
+    async def _git_snapshot(
+        self, owner: str, repository: str, sha: str,
+        entries: dict[str, GitTreeEntry], member_count: int,
+    ) -> SnapshotSource:
+        directory = tempfile.mkdtemp(prefix="token-estimator-git-")
+        output: BinaryIO | None = None
+        try:
+            await self._run_git(directory, "init", "--quiet")
+            await self._run_git(
+                directory, "remote", "add", "origin",
+                f"https://github.com/{owner}/{repository}.git",
+            )
+            await self._run_git(
+                directory, "fetch", "--quiet", "--filter=blob:none", "--no-tags",
+                "--depth=1", "origin", sha,
+            )
+            candidates = _static_candidate_paths(entries)
+            warnings: list[ScanWarning] = []
+            selected = {
+                path for path in candidates.selected
+                if entries[path].size <= self.settings.repo_max_file_bytes
+            }
+            for path in sorted(candidates.selected - selected):
+                warnings.append(ScanWarning(
+                    code="file_too_large", message="Skipped oversized text file", path=path
+                ))
+
+            manifest = entries.get("divisions.json")
+            manifest_limit = min(self.settings.repo_max_file_bytes, 256 * 1024)
+            checkout_paths = set(selected)
+            if manifest is not None and manifest.size <= manifest_limit:
+                checkout_paths.add("divisions.json")
+
+            if checkout_paths:
+                await self._run_git(directory, "sparse-checkout", "init", "--no-cone")
+                await self._run_git(
+                    directory, "sparse-checkout", "set", "--no-cone", "--stdin",
+                    input_bytes=_sparse_checkout_input(checkout_paths),
+                )
+                await self._run_git(
+                    directory, "checkout", "--quiet", "--force", "--detach", "FETCH_HEAD"
+                )
+
+            if manifest is not None and "divisions.json" in checkout_paths:
+                try:
+                    with open(os.path.join(directory, "divisions.json"), "rb") as handle:
+                        manifest_data = handle.read(manifest_limit + 1)
+                except OSError:
+                    manifest_data = b""
+                roots = _catalog_roots(manifest_data)
+                catalog = {
+                    path for path, entry in entries.items()
+                    if PurePosixPath(path).suffix.lower() == ".md"
+                    and len(PurePosixPath(path).parts) > 1
+                    and PurePosixPath(path).parts[0] in roots
+                    and entry.size <= self.settings.repo_max_file_bytes
+                }
+                oversized_catalog = {
+                    path for path, entry in entries.items()
+                    if PurePosixPath(path).suffix.lower() == ".md"
+                    and len(PurePosixPath(path).parts) > 1
+                    and PurePosixPath(path).parts[0] in roots
+                    and entry.size > self.settings.repo_max_file_bytes
+                }
+                for path in sorted(oversized_catalog):
+                    warnings.append(ScanWarning(
+                        code="file_too_large", message="Skipped oversized text file", path=path
+                    ))
+                selected.update(catalog)
+                checkout_paths.update(catalog)
+                if len(selected) > self.settings.repo_max_relevant_files:
+                    raise ServiceProblem(
+                        413, "too_many_relevant_files",
+                        "repository contains too many relevant files",
+                    )
+                if catalog:
+                    await self._run_git(
+                        directory, "sparse-checkout", "set", "--no-cone", "--stdin",
+                        input_bytes=_sparse_checkout_input(checkout_paths),
+                    )
+
+            relevant_bytes = sum(entries[path].size for path in selected)
+            if relevant_bytes > self.settings.repo_max_content_bytes:
+                raise ServiceProblem(
+                    413, "relevant_content_too_large",
+                    "relevant repository text exceeds the configured limit",
+                )
+
+            ordered = sorted(selected)
+            regular = [path for path in ordered if entries[path].mode != "120000"]
+            raw_blobs = b""
+            if regular:
+                raw_blobs = await self._run_git(
+                    directory, "cat-file", "--batch",
+                    input_bytes=("\n".join(entries[path].oid for path in regular) + "\n").encode(),
+                )
+            blob_values = _parse_cat_file_batch(raw_blobs, regular, entries)
+            output = tempfile.SpooledTemporaryFile(
+                max_size=self.settings.repo_archive_memory_bytes, mode="w+b"
+            )
+            with tarfile.open(fileobj=output, mode="w") as bundle:
+                for path in ordered:
+                    entry = entries[path]
+                    info = tarfile.TarInfo(f"snapshot/{path}")
+                    info.mode = int(entry.mode[-3:], 8)
+                    if entry.mode == "120000":
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = ""
+                        bundle.addfile(info)
+                        continue
+                    data = blob_values[path]
+                    info.size = len(data)
+                    bundle.addfile(info, io.BytesIO(data))
+                if manifest is not None and "divisions.json" in checkout_paths:
+                    with open(os.path.join(directory, "divisions.json"), "rb") as handle:
+                        data = handle.read(manifest_limit + 1)
+                    info = tarfile.TarInfo("snapshot/divisions.json")
+                    info.size = len(data)
+                    bundle.addfile(info, io.BytesIO(data))
+            output.seek(0)
+            return SnapshotSource(output, member_count, tuple(warnings))
+        except BaseException:
+            if output is not None:
+                output.close()
+            raise
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    async def _archive_download(
+        self, owner: str, repository: str, sha: str, *, preflight: bool = True,
+    ) -> BinaryIO:
+        if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
+            raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
+        if preflight:
+            await self._preflight(owner, repository, sha)
         url = (
             f"{self.settings.github_api_base.rstrip('/')}/repos/{quote(owner)}/"
             f"{quote(repository)}/tarball/{sha.lower()}"
@@ -286,7 +534,9 @@ class GitHubGateway:
         except httpx.HTTPError as error:
             raise ServiceProblem(502, "github_unavailable", "GitHub archive is unavailable") from error
 
-    async def _preflight(self, owner: str, repository: str, sha: str) -> None:
+    async def _preflight(
+        self, owner: str, repository: str, sha: str,
+    ) -> tuple[dict[str, GitTreeEntry], int]:
         document = await self._json(
             f"/repos/{quote(owner)}/{quote(repository)}/git/trees/"
             f"{quote(sha.lower())}?recursive=1"
@@ -308,6 +558,7 @@ class GitHubGateway:
 
         total_bytes = 0
         paths: dict[str, int] = {}
+        blobs: dict[str, GitTreeEntry] = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ServiceProblem(
@@ -333,8 +584,24 @@ class GitHubGateway:
                 normalized = normalize_relative_path(path)
             except ValueError:
                 continue
-            if not _EXCLUDED_PARTS.intersection(PurePosixPath(normalized).parts):
+            if (
+                "\n" not in normalized and "\r" not in normalized
+                and not _EXCLUDED_PARTS.intersection(PurePosixPath(normalized).parts)
+            ):
+                oid = entry.get("sha")
+                mode = entry.get("mode", "100644")
+                if not isinstance(oid, str) or not _SHA.fullmatch(oid):
+                    raise ServiceProblem(
+                        502, "github_invalid_response",
+                        "GitHub returned an invalid repository tree entry",
+                    )
+                if not isinstance(mode, str) or not re.fullmatch(r"[0-7]{6}", mode):
+                    raise ServiceProblem(
+                        502, "github_invalid_response",
+                        "GitHub returned an invalid repository tree entry",
+                    )
                 paths[normalized] = size
+                blobs[normalized] = GitTreeEntry(normalized, oid, mode, size)
 
         candidates = _static_candidate_paths(paths)
         if len(candidates.selected) > self.settings.repo_max_relevant_files:
@@ -351,6 +618,7 @@ class GitHubGateway:
                 413, "relevant_content_too_large",
                 "relevant repository text exceeds the configured limit",
             )
+        return blobs, len(entries) + 1
 
     async def _read_limited(self, response: httpx.Response) -> BinaryIO:
         raw_length = response.headers.get("content-length")
@@ -525,6 +793,20 @@ def _frontmatter_metadata(content: str) -> tuple[str | None, str | None]:
     return name, description
 
 
+def _catalog_roots(data: bytes) -> set[str]:
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(document, dict) or not isinstance(document.get("divisions"), dict):
+        return set()
+    return {
+        name
+        for name, metadata in document["divisions"].items()
+        if isinstance(name, str) and _NAME.fullmatch(name) and isinstance(metadata, dict)
+    }
+
+
 def _catalog_agent_paths(
     tar: tarfile.TarFile,
     members: dict[str, tarfile.TarInfo],
@@ -538,17 +820,7 @@ def _catalog_agent_paths(
     handle = tar.extractfile(manifest)
     if handle is None:
         return set()
-    try:
-        document = json.loads(handle.read(manifest_limit + 1).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return set()
-    if not isinstance(document, dict) or not isinstance(document.get("divisions"), dict):
-        return set()
-    roots = {
-        name
-        for name, metadata in document["divisions"].items()
-        if isinstance(name, str) and _NAME.fullmatch(name) and isinstance(metadata, dict)
-    }
+    roots = _catalog_roots(handle.read(manifest_limit + 1))
     return {
         path
         for path in members
@@ -556,6 +828,36 @@ def _catalog_agent_paths(
         and len(PurePosixPath(path).parts) > 1
         and PurePosixPath(path).parts[0] in roots
     }
+
+
+def _parse_cat_file_batch(
+    document: bytes,
+    paths: list[str],
+    entries: dict[str, GitTreeEntry],
+) -> dict[str, bytes]:
+    """Decode the length-framed output of one local `git cat-file --batch`."""
+    values: dict[str, bytes] = {}
+    offset = 0
+    for path in paths:
+        line_end = document.find(b"\n", offset)
+        if line_end < 0:
+            raise ServiceProblem(502, "git_invalid_response", "Git returned an incomplete blob batch")
+        header = document[offset:line_end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise ServiceProblem(502, "git_invalid_response", "Git returned an invalid blob batch")
+        try:
+            size = int(header[2])
+        except ValueError as error:
+            raise ServiceProblem(502, "git_invalid_response", "Git returned an invalid blob size") from error
+        start = line_end + 1
+        end = start + size
+        if size != entries[path].size or end >= len(document) or document[end:end + 1] != b"\n":
+            raise ServiceProblem(502, "git_invalid_response", "Git returned an invalid blob body")
+        values[path] = document[start:end]
+        offset = end + 1
+    if offset != len(document):
+        raise ServiceProblem(502, "git_invalid_response", "Git returned unexpected blob data")
+    return values
 
 
 def _mcp_servers(path: str, content: str) -> list[McpServerSummary]:
@@ -697,9 +999,12 @@ def analyze_archive(
     identity: RepositoryIdentity,
     encoding: str,
     settings: Settings,
+    *,
+    archive_member_count: int | None = None,
+    initial_warnings: Iterable[ScanWarning] = (),
 ) -> SnapshotAnalysis:
     counter = counter_for(encoding)
-    warnings: list[ScanWarning] = []
+    warnings = list(initial_warnings)
     archive_file: BinaryIO
     if isinstance(archive, bytes):
         archive_file = io.BytesIO(archive)
@@ -707,7 +1012,7 @@ def analyze_archive(
         archive.seek(0)
         archive_file = archive
     try:
-        tar = tarfile.open(fileobj=archive_file, mode="r:gz")
+        tar = tarfile.open(fileobj=archive_file, mode="r:*")
     except tarfile.TarError as error:
         raise ServiceProblem(502, "invalid_archive", "GitHub returned an invalid tar archive") from error
     with tar:
@@ -901,12 +1206,58 @@ def analyze_archive(
         category_totals=totals,
         warnings=_aggregate_warnings(warnings),
         scan=ScanStats(
-            archive_members=len(members), relevant_files=len(texts), relevant_bytes=total_bytes
+            archive_members=(
+                archive_member_count if archive_member_count is not None else len(members)
+            ),
+            relevant_files=len(texts), relevant_bytes=total_bytes
         ),
     )
     return SnapshotAnalysis(
         report=report, contents=contents, file_bytes=file_bytes,
         weight=total_bytes + len(report.model_dump_json()),
+    )
+
+
+def retokenize_analysis(
+    analysis: SnapshotAnalysis, encoding: str,
+) -> SnapshotAnalysis:
+    """Recount a discovered snapshot without downloading or parsing it again."""
+    counter = counter_for(encoding)
+    inventory: list[InventoryItem] = []
+    for item in analysis.report.inventory:
+        components: list[InventoryComponent] = []
+        for component in item.components:
+            content = analysis.contents.get(component.id, "")
+            if item.kind == "skill" and component.role == "metadata":
+                tokens = counter(item.name or "") + counter(item.description or "")
+            else:
+                tokens = counter(content)
+            components.append(component.model_copy(update={"tokens": tokens}))
+        tokens = None if item.tokens is None else sum(
+            component.tokens for component in components
+        )
+        inventory.append(item.model_copy(update={
+            "components": components,
+            "tokens": tokens,
+        }))
+
+    totals: dict[str, int] = {}
+    for item in inventory:
+        if item.tokens is not None:
+            totals[item.kind] = totals.get(item.kind, 0) + item.tokens
+    totals["all_discovered_text"] = sum(totals.values())
+    report = analysis.report.model_copy(update={
+        "method": method_info(encoding),
+        "inventory": inventory,
+        "metadata_tokens": _metadata_token_total(inventory, counter),
+        "category_totals": totals,
+        "cached": False,
+    })
+    return SnapshotAnalysis(
+        report=report,
+        contents=analysis.contents,
+        file_bytes=analysis.file_bytes,
+        weight=sum(analysis.file_bytes.values()) + len(report.model_dump_json()),
     )
 
 
@@ -923,6 +1274,7 @@ class RepositoryManager:
             settings.badge_cache_ttl_seconds,
         )
         self.singleflight = SingleFlight()
+        self.snapshot_singleflight = SingleFlight()
         self.resolution_cache = AsyncTTLCache(
             max(128, settings.report_cache_entries * 4), 4 * 1024 * 1024, 300,
         )
@@ -944,15 +1296,8 @@ class RepositoryManager:
     def close(self) -> None:
         self.scan_executor.shutdown(wait=True, cancel_futures=True)
 
-    async def _analyze_in_worker(
-        self,
-        archive: bytes | BinaryIO,
-        identity: RepositoryIdentity,
-        encoding: str,
-    ) -> SnapshotAnalysis:
-        future = self.scan_executor.submit(
-            partial(analyze_archive, archive, identity, encoding, self.settings)
-        )
+    async def _run_in_worker(self, function: Callable[[], _T]) -> _T:
+        future = self.scan_executor.submit(function)
         cancelled = False
         while not future.done():
             try:
@@ -964,10 +1309,26 @@ class RepositoryManager:
             raise asyncio.CancelledError()
         return future.result()
 
-    def cache_key(self, identity: RepositoryIdentity, encoding: str) -> str:
+    async def _analyze_in_worker(
+        self,
+        source: bytes | BinaryIO | SnapshotSource,
+        identity: RepositoryIdentity,
+        encoding: str,
+    ) -> SnapshotAnalysis:
+        if isinstance(source, SnapshotSource):
+            function = partial(
+                analyze_archive, source.archive, identity, encoding, self.settings,
+                archive_member_count=source.archive_members,
+                initial_warnings=source.warnings,
+            )
+        else:
+            function = partial(analyze_archive, source, identity, encoding, self.settings)
+        return await self._run_in_worker(function)
+
+    def cache_key(self, identity: RepositoryIdentity) -> str:
         return "|".join((
             identity.owner.lower(), identity.name.lower(), identity.commit_sha.lower(),
-            encoding, self.settings.analyzer_version,
+            self.settings.analyzer_version,
         ))
 
     @staticmethod
@@ -1129,32 +1490,51 @@ class RepositoryManager:
             "subdirectory": None,
             "html_url": f"https://github.com/{owner}/{repository}/tree/{sha.lower()}",
         })
-        key = self.cache_key(full_identity, selected)
-        cached = await self.cache.get(key)
-        if cached is not None:
-            return scope_analysis(cached, normalized_path, cached=True)
+        key = self.cache_key(full_identity)
+        cached: CachedRepository | None = await self.cache.get(key)
+        if cached is not None and selected in cached.analyses:
+            return scope_analysis(cached.analyses[selected], normalized_path, cached=True)
 
         async def load() -> SnapshotAnalysis:
-            second = await self.cache.get(key)
-            if second is not None:
-                return second
-            async with self._scan_admission():
-                await self._consume_repo_quota(ip, include_ip_quota)
-                await self._ensure_public(owner, repository)
-                archive = await self.gateway.archive(owner, repository, sha)
-                try:
-                    result = await self._analyze_in_worker(
-                        archive, full_identity, selected
-                    )
-                finally:
-                    if not isinstance(archive, bytes):
-                        archive.close()
-            await self.cache.set(key, result, result.weight)
+            second: CachedRepository | None = await self.cache.get(key)
+            if second is not None and selected in second.analyses:
+                return second.analyses[selected]
+
+            async def discover() -> CachedRepository:
+                existing: CachedRepository | None = await self.cache.get(key)
+                if existing is not None:
+                    return existing
+                async with self._scan_admission():
+                    await self._consume_repo_quota(ip, include_ip_quota)
+                    await self._ensure_public(owner, repository)
+                    source = await self.gateway.archive(owner, repository, sha)
+                    handle = source.archive if isinstance(source, SnapshotSource) else source
+                    try:
+                        result = await self._analyze_in_worker(
+                            source, full_identity, selected
+                        )
+                    finally:
+                        if not isinstance(handle, bytes):
+                            handle.close()
+                entry = CachedRepository({selected: result})
+                await self.cache.set(key, entry, entry.weight)
+                return entry
+
+            entry = await self.snapshot_singleflight.run(key, discover)
+            result = entry.analyses.get(selected)
+            if result is None:
+                base = next(iter(entry.analyses.values()))
+                result = await self._run_in_worker(
+                    partial(retokenize_analysis, base, selected)
+                )
+                entry.analyses[selected] = result
+                await self.cache.set(key, entry, entry.weight)
             return result
 
         try:
             full_analysis = await asyncio.wait_for(
-                self.singleflight.run(key, load), self.settings.repo_timeout_seconds
+                self.singleflight.run(f"{key}|{selected}", load),
+                self.settings.repo_timeout_seconds,
             )
             return scope_analysis(full_analysis, normalized_path, cached=False)
         except asyncio.TimeoutError as error:
@@ -1176,8 +1556,10 @@ class RepositoryManager:
             owner=owner, name=repository, commit_sha=sha.lower(),
             html_url=f"https://github.com/{owner}/{repository}/tree/{sha.lower()}",
         )
-        cached = await self.cache.get(self.cache_key(identity, selected))
-        return scope_analysis(cached, normalized_path, cached=True) if cached else None
+        cached: CachedRepository | None = await self.cache.get(self.cache_key(identity))
+        if cached is None or selected not in cached.analyses:
+            return None
+        return scope_analysis(cached.analyses[selected], normalized_path, cached=True)
 
     async def _consume_resolution_quota(self) -> None:
         if not self.settings.quotas_enabled:
