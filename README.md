@@ -192,7 +192,7 @@ MCP server maintainers are encouraged to generate and commit a root-level `mcp-t
 
 The snapshot requires `format`, `formatVersion`, `server.name`, and `tools`; every tool requires a unique `name` and an object `inputSchema`. Copy the complete, sanitized result of all paginated `tools/list` responses into `tools`, preserving standard fields such as `title`, `description`, `outputSchema`, `annotations`, and `icons` when present. Do not commit the JSON-RPC envelope, cursors, `_meta`, credentials, runtime arguments, or tool results. Regenerate the snapshot in trusted local development or CI whenever tool definitions change.
 
-Repository reports currently count a canonical definition containing each tool's name, description, and input schema. When a supported MCP SDK dependency is detected but no valid snapshot exists, the report warns that MCP context is excluded because the service does not execute the server or call `tools/list`.
+Repository reports count a canonical definition containing each tool's name, description, and input schema. Each MCP tool card also shows the token counts for those three parts alongside the full canonical definition count. The parts explain where the definition's tokens come from but are not additive because the full JSON definition includes field names and serialization punctuation. When a supported MCP SDK dependency is detected but no valid snapshot exists, the report warns that MCP context is excluded because the service does not execute the server or call `tools/list`.
 
 ## Caching and limits
 

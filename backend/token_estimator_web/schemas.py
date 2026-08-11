@@ -194,6 +194,13 @@ class McpServerSummary(ApiModel):
     transport: Literal["stdio", "http", "sse", "unknown"]
 
 
+class McpToolBreakdown(ApiModel):
+    name: int = Field(ge=0)
+    description: int = Field(ge=0)
+    input_schema: int = Field(ge=0)
+    definition: int = Field(ge=0)
+
+
 class InventoryItem(ApiModel):
     id: str
     path: str
@@ -206,6 +213,7 @@ class InventoryItem(ApiModel):
     tokens: int | None = Field(default=None, ge=0)
     components: list[InventoryComponent] = Field(default_factory=list)
     mcp_servers: list[McpServerSummary] = Field(default_factory=list)
+    mcp_tool_breakdown: McpToolBreakdown | None = None
     accounting_note: str | None = None
 
 

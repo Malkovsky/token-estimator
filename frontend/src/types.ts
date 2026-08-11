@@ -10,6 +10,9 @@ export type InventoryItem = {
   harnesses: string[]; load_policy: string;
   characters: number | null; tokens: number | null; components: InventoryComponent[];
   mcp_servers: { name: string; transport: string }[];
+  mcp_tool_breakdown: {
+    name: number; description: number; input_schema: number; definition: number;
+  } | null;
   accounting_note: string | null;
 };
 export type RepositoryReport = {

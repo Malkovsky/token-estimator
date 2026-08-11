@@ -22,11 +22,13 @@ from token_estimator_web.providers import NativeCountManager
 from token_estimator_web.errors import ServiceProblem
 from token_estimator_web.repository import (
     GitHubGateway, RepositoryManager, analyze_archive, parse_repository,
+    retokenize_analysis,
 )
 from token_estimator_web.schemas import (
     NativeCountRequest, NativeSnapshot, RepositoryIdentity, RepositoryResolveRequest,
     RepositoryResolveResponse, ScanWarning,
 )
+from token_estimator_web.service import counter_for
 
 
 SKILL = """---
@@ -312,7 +314,18 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
     assert tool.path == "mcp-tools.json#search"
     assert tool.tokens and tool.tokens > 0
     assert tool.components[0].role == "definition"
-    assert result.report.metadata_tokens > 0
+    breakdown = tool.mcp_tool_breakdown
+    assert breakdown is not None
+    counter = counter_for("o200k_base")
+    schema_text = json.dumps(
+        snapshot["tools"][0]["inputSchema"], ensure_ascii=False,
+        separators=(",", ":"), sort_keys=True,
+    )
+    assert breakdown.name == counter("search")
+    assert breakdown.description == counter("Search indexed symbols.")
+    assert breakdown.input_schema == counter(schema_text)
+    assert breakdown.definition == tool.tokens
+    assert result.report.metadata_tokens == breakdown.name + breakdown.description
     assert result.report.category_totals["mcp_tool"] == tool.tokens
     assert result.report.category_totals["all_discovered_text"] == tool.tokens
     assert result.report.scan.relevant_files == 1
@@ -321,6 +334,19 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
     assert '"name":"search"' in definition
     assert '"inputSchema"' in definition
     assert "outputSchema" not in definition
+
+    retokenized = retokenize_analysis(result, "cl100k_base")
+    retokenized_tool = retokenized.report.inventory[0]
+    retokenized_breakdown = retokenized_tool.mcp_tool_breakdown
+    assert retokenized_breakdown is not None
+    cl100k = counter_for("cl100k_base")
+    assert retokenized_breakdown.name == cl100k("search")
+    assert retokenized_breakdown.description == cl100k("Search indexed symbols.")
+    assert retokenized_breakdown.input_schema == cl100k(schema_text)
+    assert retokenized_breakdown.definition == retokenized_tool.tokens
+    assert retokenized.report.metadata_tokens == (
+        retokenized_breakdown.name + retokenized_breakdown.description
+    )
 
 
 def test_repository_warns_when_mcp_implementation_has_no_tool_snapshot() -> None:

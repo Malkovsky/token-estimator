@@ -32,9 +32,9 @@ from .cache import AsyncTTLCache, QuotaExceeded, SingleFlight, SlidingQuota
 from .config import Settings
 from .errors import ServiceProblem
 from .schemas import (
-    InventoryComponent, InventoryItem, McpServerSummary, RepositoryIdentity,
-    RepositoryReport, RepositoryResolveRequest, RepositoryResolveResponse,
-    ScanStats, ScanWarning,
+    InventoryComponent, InventoryItem, McpServerSummary, McpToolBreakdown,
+    RepositoryIdentity, RepositoryReport, RepositoryResolveRequest,
+    RepositoryResolveResponse, ScanStats, ScanWarning,
 )
 from .service import counter_for, method_info, selected_encoding
 
@@ -1084,6 +1084,7 @@ def _mcp_snapshot_inventory(
         if name in names:
             raise ValueError(f"duplicate tool name {name!r}")
         names.add(name)
+        schema_text = compact_json(schema)
         definition = compact_json({
             "name": name, "description": description, "inputSchema": schema,
         })
@@ -1100,9 +1101,14 @@ def _mcp_snapshot_inventory(
             description=description or None, harnesses=["mcp"],
             load_policy="discovery", characters=component.characters,
             tokens=component.tokens, components=[component],
+            mcp_tool_breakdown=McpToolBreakdown(
+                name=counter(name), description=counter(description),
+                input_schema=counter(schema_text), definition=component.tokens,
+            ),
             accounting_note=(
-                f"Generated tools/list snapshot for {server_name}; runtime tool results "
-                "and server instructions are excluded."
+                f"Generated tools/list snapshot for {server_name}. The full definition "
+                "is counted as one JSON object; breakdown values are explanatory and "
+                "non-additive. Runtime tool results and server instructions are excluded."
             ),
         ))
     return inventory, contents
@@ -1494,9 +1500,27 @@ def retokenize_analysis(
         tokens = None if item.tokens is None else sum(
             component.tokens for component in components
         )
+        mcp_tool_breakdown = item.mcp_tool_breakdown
+        if mcp_tool_breakdown is not None:
+            definition = next((
+                analysis.contents.get(component.id, "")
+                for component in item.components if component.role == "definition"
+            ), "")
+            try:
+                document = json.loads(definition)
+                schema = document.get("inputSchema", {}) if isinstance(document, dict) else {}
+            except json.JSONDecodeError:
+                schema = {}
+            mcp_tool_breakdown = McpToolBreakdown(
+                name=counter(item.name or ""),
+                description=counter(item.description or ""),
+                input_schema=counter(compact_json(schema)),
+                definition=counter(definition),
+            )
         inventory.append(item.model_copy(update={
             "components": components,
             "tokens": tokens,
+            "mcp_tool_breakdown": mcp_tool_breakdown,
         }))
 
     totals: dict[str, int] = {}

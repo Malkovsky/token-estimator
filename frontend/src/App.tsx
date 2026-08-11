@@ -177,6 +177,12 @@ function useTurnstile(capabilities: Capabilities | null) {
 function InventoryCard({ item, selected, toggle }: { item: InventoryItem; selected: Set<string>; toggle: (id: string) => void }) {
   return <article className="inventory-card">
     <div className="inventory-heading"><div><div className="badges"><span>{title(item.kind)}</span>{item.harnesses.map((harness) => <span key={harness} className="muted-badge">{title(harness)}</span>)}</div><h3>{item.path}</h3>{item.description && <p className="metadata-description">{item.description}</p>}</div><strong>{number(item.tokens)} <small>tokens</small></strong></div>
+    {item.mcp_tool_breakdown && <div className="mcp-breakdown">
+      <span><small>Name</small><strong>{number(item.mcp_tool_breakdown.name)}</strong></span>
+      <span><small>Description</small><strong>{number(item.mcp_tool_breakdown.description)}</strong></span>
+      <span><small>Input schema</small><strong>{number(item.mcp_tool_breakdown.input_schema)}</strong></span>
+      <span className="definition-total"><small>Full definition</small><strong>{number(item.mcp_tool_breakdown.definition)}</strong></span>
+    </div>}
     {item.components.length > 0 && <div className="components">{item.components.map((component) => <label key={component.id}>
       <input type="checkbox" checked={selected.has(component.id)} onChange={() => toggle(component.id)} />
       <span><strong>{title(component.role)}</strong><small>{component.path}</small></span><b>{number(component.tokens)}</b>

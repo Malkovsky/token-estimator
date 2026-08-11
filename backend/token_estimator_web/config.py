@@ -81,7 +81,7 @@ class Settings:
     turnstile_secret_key: str
     turnstile_expected_hostname: str
     turnstile_required: bool
-    analyzer_version: str = "repo-inventory-v10"
+    analyzer_version: str = "repo-inventory-v11"
 
     @classmethod
     def from_env(cls) -> "Settings":
