@@ -175,7 +175,9 @@ LoadPolicy = Literal[
     "progressive", "discovery", "activation", "on_demand",
     "hierarchical", "conditional", "configuration_only"
 ]
-InventoryKind = Literal["skill", "instruction", "rule", "prompt", "agent", "mcp_config"]
+InventoryKind = Literal[
+    "skill", "instruction", "rule", "prompt", "agent", "mcp_config", "mcp_tool"
+]
 
 
 class InventoryComponent(ApiModel):

@@ -276,6 +276,96 @@ def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> Non
     assert link_warning.count == 2
 
 
+def test_repository_counts_committed_mcp_tools_snapshot() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="mcp-server", commit_sha="6" * 40,
+        html_url=f"https://github.com/owner/mcp-server/tree/{'6' * 40}",
+    )
+    snapshot = {
+        "format": "mcp-tools-snapshot",
+        "formatVersion": 1,
+        "server": {"name": "demo-mcp", "version": "1.0.0"},
+        "tools": [{
+            "name": "search",
+            "title": "Search",
+            "description": "Search indexed symbols.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            "outputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": True},
+        }],
+    }
+    result = analyze_archive(archive({
+        "pyproject.toml": b'[project]\ndependencies = ["mcp>=2,<3"]\n',
+        "mcp-tools.json": json.dumps(snapshot).encode(),
+    }), identity, "o200k_base", settings)
+
+    assert len(result.report.inventory) == 1
+    tool = result.report.inventory[0]
+    assert tool.kind == "mcp_tool"
+    assert tool.name == "search"
+    assert tool.description == "Search indexed symbols."
+    assert tool.path == "mcp-tools.json#search"
+    assert tool.tokens and tool.tokens > 0
+    assert tool.components[0].role == "definition"
+    assert result.report.metadata_tokens > 0
+    assert result.report.category_totals["mcp_tool"] == tool.tokens
+    assert result.report.category_totals["all_discovered_text"] == tool.tokens
+    assert result.report.scan.relevant_files == 1
+    assert not any(warning.code == "mcp_tools_unavailable" for warning in result.report.warnings)
+    definition = result.contents[tool.components[0].id]
+    assert '"name":"search"' in definition
+    assert '"inputSchema"' in definition
+    assert "outputSchema" not in definition
+
+
+def test_repository_warns_when_mcp_implementation_has_no_tool_snapshot() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="mcp-server", commit_sha="7" * 40,
+        html_url=f"https://github.com/owner/mcp-server/tree/{'7' * 40}",
+    )
+    result = analyze_archive(archive({
+        "pyproject.toml": b'[project]\nname = "demo-mcp"\ndependencies = ["mcp>=2,<3"]\n',
+        "README.md": b"# MCP server",
+    }), identity, "o200k_base", settings)
+
+    assert result.report.inventory == []
+    assert result.report.metadata_tokens == 0
+    warning = next(
+        warning for warning in result.report.warnings
+        if warning.code == "mcp_tools_unavailable"
+    )
+    assert "does not execute repository code" in warning.message
+    assert "cannot call tools/list" in warning.message
+    assert "mcp-tools.json" in warning.message
+    assert result.report.scan.relevant_files == 0
+
+
+def test_repository_rejects_invalid_mcp_tools_snapshot() -> None:
+    settings = Settings.from_env()
+    identity = RepositoryIdentity(
+        owner="owner", name="mcp-server", commit_sha="9" * 40,
+        html_url=f"https://github.com/owner/mcp-server/tree/{'9' * 40}",
+    )
+    result = analyze_archive(archive({
+        "pyproject.toml": b'[project]\ndependencies = ["fastmcp>=2"]\n',
+        "mcp-tools.json": json.dumps({
+            "format": "mcp-tools-snapshot", "formatVersion": 1,
+            "server": {"name": "demo"},
+            "tools": [{"name": "broken", "inputSchema": None}],
+        }).encode(),
+    }), identity, "o200k_base", settings)
+
+    codes = {warning.code for warning in result.report.warnings}
+    assert codes == {"invalid_mcp_tools_snapshot", "mcp_tools_unavailable"}
+    assert result.report.inventory == []
+
+
 def test_nested_skills_assign_optional_files_to_nearest_skill() -> None:
     settings = Settings.from_env()
     identity = RepositoryIdentity(

@@ -23,7 +23,10 @@ import httpx
 import json5
 import yaml
 
-from token_estimator import frontmatter_identity, normalize_relative_path, split_frontmatter
+from token_estimator import (
+    compact_json, frontmatter_identity, normalize_relative_path, normalize_tool,
+    split_frontmatter,
+)
 
 from .cache import AsyncTTLCache, QuotaExceeded, SingleFlight, SlidingQuota
 from .config import Settings
@@ -44,6 +47,11 @@ except ImportError:  # pragma: no cover - Python 3.10 only
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _TEXT_SUFFIXES = {".json", ".md", ".mdc", ".rst", ".toml", ".txt", ".yaml", ".yml"}
+_MCP_TOOLS_SNAPSHOT = "mcp-tools.json"
+_MCP_PROBE_FILES = {
+    "pyproject.toml", "package.json", "Cargo.toml", "go.mod",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+}
 _EXCLUDED_PARTS = {
     ".git", ".hg", ".svn", ".venv", "node_modules", "vendor", "dist",
     "build", "target", ".cache", "__pycache__",
@@ -146,6 +154,8 @@ class CandidatePaths:
     skill_files: list[str]
     optional_paths: dict[PurePosixPath, list[str]]
     selected: set[str]
+    mcp_snapshot: str | None
+    mcp_probes: set[str]
 
 
 def _stable_id(*parts: str) -> str:
@@ -801,19 +811,25 @@ def _is_optional_skill_text(path: PurePosixPath, root: PurePosixPath) -> bool:
 
 def _static_candidate_paths(paths: Iterable[str]) -> CandidatePaths:
     """Select candidates using paths alone, before any repository content is read."""
+    available = list(paths)
+    available_set = set(available)
     skill_files = sorted(
-        path for path in paths if PurePosixPath(path).name == "SKILL.md"
+        path for path in available if PurePosixPath(path).name == "SKILL.md"
     )
     skill_roots = {PurePosixPath(path).parent for path in skill_files}
     optional_paths: dict[PurePosixPath, list[str]] = {
         root: [] for root in skill_roots
     }
-    selected: set[str] = set(skill_files)
-    for path in paths:
+    mcp_snapshot = _MCP_TOOLS_SNAPSHOT if _MCP_TOOLS_SNAPSHOT in available_set else None
+    mcp_probes = _MCP_PROBE_FILES.intersection(available_set)
+    selected: set[str] = set(skill_files) | mcp_probes
+    if mcp_snapshot:
+        selected.add(mcp_snapshot)
+    for path in available:
         pure = PurePosixPath(path)
         if _detection(path):
             selected.add(path)
-        if pure.name == "SKILL.md":
+        if pure.name == "SKILL.md" or path == _MCP_TOOLS_SNAPSHOT:
             continue
         root = _nearest_skill_root(pure, skill_roots)
         if root is not None and _is_optional_skill_text(pure, root):
@@ -823,6 +839,8 @@ def _static_candidate_paths(paths: Iterable[str]) -> CandidatePaths:
         skill_files=skill_files,
         optional_paths=optional_paths,
         selected=selected,
+        mcp_snapshot=mcp_snapshot,
+        mcp_probes=mcp_probes,
     )
 
 
@@ -957,6 +975,137 @@ def _mcp_servers(path: str, content: str) -> list[McpServerSummary]:
             transport = "unknown"
         result.append(McpServerSummary(name=name, transport=transport))
     return result
+
+
+def _python_requirement_name(value: str) -> str:
+    match = re.match(r"\s*([A-Za-z0-9_.-]+)", value)
+    return match.group(1).lower().replace("_", "-").replace(".", "-") if match else ""
+
+
+def _string_values(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+
+
+def _mcp_implementation_detected(probes: dict[str, str]) -> bool:
+    """Recognize explicit MCP SDK dependencies without inspecting executable source."""
+    for path, content in probes.items():
+        try:
+            if path == "pyproject.toml":
+                document = tomllib.loads(content)
+                project = document.get("project", {})
+                dependencies: list[str] = []
+                if isinstance(project, dict):
+                    dependencies.extend(
+                        item for item in project.get("dependencies", []) if isinstance(item, str)
+                    )
+                    optional = project.get("optional-dependencies", {})
+                    if isinstance(optional, dict):
+                        dependencies.extend(_string_values(optional))
+                dependency_groups = document.get("dependency-groups", {})
+                if isinstance(dependency_groups, dict):
+                    for group in dependency_groups.values():
+                        if isinstance(group, list):
+                            dependencies.extend(
+                                item for item in group if isinstance(item, str)
+                            )
+                if any(
+                    _python_requirement_name(item) in {"mcp", "fastmcp"}
+                    for item in dependencies
+                ):
+                    return True
+            elif path == "package.json":
+                document = json.loads(content)
+                if isinstance(document, dict):
+                    names: set[str] = set()
+                    for key in ("dependencies", "devDependencies", "peerDependencies"):
+                        values = document.get(key, {})
+                        if isinstance(values, dict):
+                            names.update(str(name).lower() for name in values)
+                    if names.intersection({"@modelcontextprotocol/sdk", "fastmcp"}):
+                        return True
+            elif path == "Cargo.toml":
+                if re.search(r"(?mi)^\s*(?:rmcp|rust-mcp-sdk)\s*=", content):
+                    return True
+            elif path == "go.mod":
+                if re.search(
+                    r"(?mi)^\s*(?:github\.com/mark3labs/mcp-go|github\.com/modelcontextprotocol/go-sdk)\b",
+                    content,
+                ):
+                    return True
+            elif path in {"pom.xml", "build.gradle", "build.gradle.kts"}:
+                if "io.modelcontextprotocol" in content:
+                    return True
+        except (json.JSONDecodeError, tomllib.TOMLDecodeError, TypeError):
+            continue
+    return False
+
+
+def _mcp_snapshot_inventory(
+    content: str, counter: Any, settings: Settings,
+) -> tuple[list[InventoryItem], dict[str, str]]:
+    """Parse the repository's explicit, non-standard tools/list snapshot convention."""
+    document = json.loads(content)
+    if not isinstance(document, dict):
+        raise ValueError("snapshot must be a JSON object")
+    if document.get("format") != "mcp-tools-snapshot":
+        raise ValueError("format must be 'mcp-tools-snapshot'")
+    if document.get("formatVersion") != 1:
+        raise ValueError("formatVersion must be 1")
+    server = document.get("server")
+    if (
+        not isinstance(server, dict)
+        or not isinstance(server.get("name"), str)
+        or not server["name"].strip()
+    ):
+        raise ValueError("server.name must be a non-empty string")
+    tools = document.get("tools")
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
+    if len(tools) > settings.max_tools:
+        raise ValueError(f"tools exceeds the configured limit of {settings.max_tools}")
+
+    inventory: list[InventoryItem] = []
+    contents: dict[str, str] = {}
+    names: set[str] = set()
+    server_name = server["name"].strip()
+    for raw_tool in tools:
+        if not isinstance(raw_tool, dict):
+            raise ValueError("every tool must be a JSON object")
+        if not isinstance(raw_tool.get("inputSchema"), dict):
+            raise ValueError("every tool must contain an object inputSchema")
+        name, description, schema = normalize_tool(raw_tool)
+        if name in names:
+            raise ValueError(f"duplicate tool name {name!r}")
+        names.add(name)
+        definition = compact_json({
+            "name": name, "description": description, "inputSchema": schema,
+        })
+        item_path = f"{_MCP_TOOLS_SNAPSHOT}#{name}"
+        component_id = _stable_id(_MCP_TOOLS_SNAPSHOT, "mcp_tool", name, "definition")
+        component = InventoryComponent(
+            id=component_id, path=item_path, role="definition", load_policy="discovery",
+            characters=len(definition), tokens=counter(definition),
+        )
+        contents[component_id] = definition
+        inventory.append(InventoryItem(
+            id=_stable_id(_MCP_TOOLS_SNAPSHOT, "mcp_tool", name),
+            path=item_path, kind="mcp_tool", name=name,
+            description=description or None, harnesses=["mcp"],
+            load_policy="discovery", characters=component.characters,
+            tokens=component.tokens, components=[component],
+            accounting_note=(
+                f"Generated tools/list snapshot for {server_name}; runtime tool results "
+                "and server instructions are excluded."
+            ),
+        ))
+    return inventory, contents
 
 
 def _aggregate_warnings(warnings: list[ScanWarning]) -> list[ScanWarning]:
@@ -1159,9 +1308,47 @@ def analyze_archive(
             except UnicodeDecodeError:
                 warnings.append(ScanWarning(code="invalid_utf8", message="Skipped non-UTF-8 file", path=path))
 
+    probe_contents = {
+        path: texts[path] for path in candidates.mcp_probes if path in texts
+    }
+    mcp_implementation = _mcp_implementation_detected(probe_contents)
+    skill_optional_paths = {
+        path for paths in candidates.optional_paths.values() for path in paths
+    }
+    for path in candidates.mcp_probes - skill_optional_paths:
+        texts.pop(path, None)
+        size = file_bytes.pop(path, 0)
+        total_bytes -= size
+
     inventory: list[InventoryItem] = []
     contents: dict[str, str] = {}
     owned: set[str] = set()
+    mcp_snapshot_valid = False
+    if candidates.mcp_snapshot and candidates.mcp_snapshot in texts:
+        try:
+            snapshot_inventory, snapshot_contents = _mcp_snapshot_inventory(
+                texts[candidates.mcp_snapshot], counter, settings
+            )
+            inventory.extend(snapshot_inventory)
+            contents.update(snapshot_contents)
+            mcp_snapshot_valid = True
+        except (json.JSONDecodeError, ValueError) as error:
+            warnings.append(ScanWarning(
+                code="invalid_mcp_tools_snapshot",
+                message=f"Skipped invalid mcp-tools.json: {error}",
+                path=candidates.mcp_snapshot,
+            ))
+    if mcp_implementation and not mcp_snapshot_valid:
+        warnings.append(ScanWarning(
+            code="mcp_tools_unavailable",
+            message=(
+                "This repository appears to implement an MCP server, but no valid "
+                "mcp-tools.json snapshot was found. The estimator does not execute "
+                "repository code, so it cannot call tools/list or include MCP tool "
+                "definitions in the token total. Generate and commit mcp-tools.json "
+                "to include them."
+            ),
+        ))
     for skill_path in skill_files:
         content = texts.get(skill_path)
         if content is None:

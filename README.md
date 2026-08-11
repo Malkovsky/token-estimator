@@ -56,9 +56,9 @@ You can also enter the repository and subdirectory separately under **Advanced o
 Repository reports show a combined token summary plus separate metadata and total-token badges, with a copy button next to each. Paste the resulting Markdown into a README:
 
 ```markdown
-[![Token summary](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=summary)](https://agentic-token-estimator.onrender.com/)
-[![Metadata tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=metadata)](https://agentic-token-estimator.onrender.com/)
-[![Total tokens](https://agentic-token-estimator.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=total)](https://agentic-token-estimator.onrender.com/)
+[![Token summary](https://how-much-tokens.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=summary)](https://how-much-tokens.onrender.com/)
+[![Metadata tokens](https://how-much-tokens.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=metadata)](https://how-much-tokens.onrender.com/)
+[![Total tokens](https://how-much-tokens.onrender.com/badge/github/OWNER/REPOSITORY.svg?metric=total)](https://how-much-tokens.onrender.com/)
 ```
 
 Copied badges are pinned to the report's immutable commit. To make a badge follow a branch instead, use the branch name as `ref`, for example `ref=main` or `ref=release%2F2.x`. Each moving badge periodically resolves its branch head; branches at the same commit share one cached token summary.
@@ -156,13 +156,47 @@ The repository scanner recognizes common conventions for Codex, Claude Code, Gem
 - Claude, Cursor, Gemini, and GitHub Copilot commands, prompts, and agents;
 - manifest-declared source-agent catalogs such as Agency Agents divisions;
 - `.agents/skills`, `.claude/skills`, `.gemini/skills`, and other skill directories containing `SKILL.md`;
-- `.codex/config.toml`, `.mcp.json`, and supported harness-specific MCP configuration.
+- `.codex/config.toml`, `.mcp.json`, and supported harness-specific MCP configuration;
+- root-level `mcp-tools.json` snapshots containing generated MCP tool definitions.
 
-MCP connection files are inventoried without treating their raw contents as model context. Reports expose and count only a canonical metadata summary containing each server name and transport. Commands, arguments, URLs, headers, environment variables, and credentials are not returned and do not contribute to prompt-facing totals. Actual MCP tool names, descriptions, and input schemas are counted when supplied to the local MCP workbench; they cannot be inferred from connection configuration without contacting or executing the server.
+MCP connection files are inventoried without treating their raw contents as model context. Reports expose and count only a canonical metadata summary containing each server name and transport. Commands, arguments, URLs, headers, environment variables, and credentials are not returned and do not contribute to prompt-facing totals. Actual MCP tool names, descriptions, and input schemas are counted when supplied through a committed `mcp-tools.json` snapshot or the local MCP workbench; they cannot be inferred from connection configuration without contacting or executing the server.
+
+### Publish MCP tool definitions safely
+
+MCP server maintainers are encouraged to generate and commit a root-level `mcp-tools.json`. This project-specific snapshot lets repository reports include the server's LLM-facing tool definitions without installing dependencies, executing repository code, contacting the server, or invoking a tool. MCP itself does not standardize this repository file.
+
+```json
+{
+  "format": "mcp-tools-snapshot",
+  "formatVersion": 1,
+  "server": {
+    "name": "example-mcp",
+    "version": "1.0.0"
+  },
+  "tools": [
+    {
+      "name": "search",
+      "title": "Search",
+      "description": "Search indexed symbols.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" }
+        },
+        "required": ["query"]
+      }
+    }
+  ]
+}
+```
+
+The snapshot requires `format`, `formatVersion`, `server.name`, and `tools`; every tool requires a unique `name` and an object `inputSchema`. Copy the complete, sanitized result of all paginated `tools/list` responses into `tools`, preserving standard fields such as `title`, `description`, `outputSchema`, `annotations`, and `icons` when present. Do not commit the JSON-RPC envelope, cursors, `_meta`, credentials, runtime arguments, or tool results. Regenerate the snapshot in trusted local development or CI whenever tool definitions change.
+
+Repository reports currently count a canonical definition containing each tool's name, description, and input schema. When a supported MCP SDK dependency is detected but no valid snapshot exists, the report warns that MCP context is excluded because the service does not execute the server or call `tools/list`.
 
 ## Caching and limits
 
-Repository snapshots are fetched by immutable commit SHA. The service uses GitHub's recursive tree metadata to enforce repository-wide limits, then by default uses Git's partial-clone protocol to download only blobs that match recognized agentic-harness conventions. It checks those exact blobs out sparsely, reads their original Git objects in one batch, and discards the temporary repository after analysis. If filtered Git is unavailable, `auto` mode falls back to the bounded GitHub archive path; set `TOKEN_ESTIMATOR_REPO_FETCH_MODE` to `git` or `archive` to require either behavior.
+Repository snapshots are fetched by immutable commit SHA. The service uses GitHub's recursive tree metadata to enforce repository-wide limits, then by default uses Git's partial-clone protocol to download only blobs that match recognized agentic-harness conventions, plus small root package manifests used to detect MCP SDK dependencies. It checks those exact blobs out sparsely, reads their original Git objects in one batch, and discards the temporary repository after analysis. If filtered Git is unavailable, `auto` mode falls back to the bounded GitHub archive path; set `TOKEN_ESTIMATOR_REPO_FETCH_MODE` to `git` or `archive` to require either behavior.
 
 The resulting discovery data is held in a bounded in-memory cache by repository commit, independent of tokenizer encoding. Requesting another supported encoding reuses the retained component text and only reruns token counting; it does not fetch or parse the repository again. A folder selection filters the same full-repository result rather than creating a separate scan or cache entry.
 
