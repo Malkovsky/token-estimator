@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import PurePosixPath
-from typing import Any, BinaryIO, Callable, Iterable, TypeVar
+from typing import Any, Awaitable, BinaryIO, Callable, Iterable, TypeVar
 from urllib.parse import quote, unquote, urlencode, urlparse
 
 import httpx
@@ -49,6 +49,7 @@ _EXCLUDED_PARTS = {
     "build", "target", ".cache", "__pycache__",
 }
 _T = TypeVar("_T")
+ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def _retry_after(value: str | None, default: int = 60) -> int:
@@ -56,6 +57,21 @@ def _retry_after(value: str | None, default: int = 60) -> int:
         return max(1, int(value or default))
     except ValueError:
         return default
+
+
+async def _notify_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    message: str,
+    **details: Any,
+) -> None:
+    if callback is None:
+        return
+    try:
+        await callback({"stage": stage, "message": message, **details})
+    except Exception:
+        # Progress delivery is observational and must never fail an analysis.
+        pass
 
 
 def _sparse_checkout_input(paths: Iterable[str]) -> bytes:
@@ -293,23 +309,36 @@ class GitHubGateway:
 
     async def archive(
         self, owner: str, repository: str, sha: str,
+        progress: ProgressCallback | None = None,
     ) -> BinaryIO | SnapshotSource:
         """Fetch a bounded snapshot, preferring Git's partial-clone protocol."""
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
         mode = self.settings.repo_fetch_mode
-        if mode == "archive":
-            return await self._archive_download(owner, repository, sha)
+        await _notify_progress(
+            progress, "tree", "Inspecting the immutable repository tree"
+        )
         entries, member_count = await self._preflight(owner, repository, sha.lower())
+        if mode == "archive":
+            await _notify_progress(
+                progress, "download", "Downloading the bounded repository archive"
+            )
+            return await self._archive_download(
+                owner, repository, sha, preflight=False, progress=progress
+            )
         try:
             return await self._git_snapshot(
-                owner, repository, sha.lower(), entries, member_count
+                owner, repository, sha.lower(), entries, member_count, progress
             )
         except ServiceProblem as error:
             if mode == "git" or error.status not in {502, 503}:
                 raise
+        await _notify_progress(
+            progress, "download",
+            "Filtered Git was unavailable; downloading the bounded archive",
+        )
         return await self._archive_download(
-            owner, repository, sha, preflight=False
+            owner, repository, sha, preflight=False, progress=progress
         )
 
     async def _run_git(
@@ -365,6 +394,7 @@ class GitHubGateway:
     async def _git_snapshot(
         self, owner: str, repository: str, sha: str,
         entries: dict[str, GitTreeEntry], member_count: int,
+        progress: ProgressCallback | None = None,
     ) -> SnapshotSource:
         directory = tempfile.mkdtemp(prefix="token-estimator-git-")
         output: BinaryIO | None = None
@@ -373,6 +403,9 @@ class GitHubGateway:
             await self._run_git(
                 directory, "remote", "add", "origin",
                 f"https://github.com/{owner}/{repository}.git",
+            )
+            await _notify_progress(
+                progress, "fetch", "Fetching the immutable commit with filtered Git"
             )
             await self._run_git(
                 directory, "fetch", "--quiet", "--filter=blob:none", "--no-tags",
@@ -396,6 +429,11 @@ class GitHubGateway:
                 checkout_paths.add("divisions.json")
 
             if checkout_paths:
+                expected_bytes = sum(entries[path].size for path in selected)
+                await _notify_progress(
+                    progress, "download", "Downloading relevant agentic-harness files",
+                    files=len(selected), total_bytes=expected_bytes,
+                )
                 await self._run_git(directory, "sparse-checkout", "init", "--no-cone")
                 await self._run_git(
                     directory, "sparse-checkout", "set", "--no-cone", "--stdin",
@@ -403,6 +441,16 @@ class GitHubGateway:
                 )
                 await self._run_git(
                     directory, "checkout", "--quiet", "--force", "--detach", "FETCH_HEAD"
+                )
+                await _notify_progress(
+                    progress, "download", "Relevant files downloaded",
+                    files=len(selected), loaded_bytes=expected_bytes,
+                    total_bytes=expected_bytes,
+                )
+            else:
+                await _notify_progress(
+                    progress, "download", "No matching harness files require downloading",
+                    files=0, loaded_bytes=0, total_bytes=0,
                 )
 
             if manifest is not None and "divisions.json" in checkout_paths:
@@ -438,9 +486,20 @@ class GitHubGateway:
                         "repository contains too many relevant files",
                     )
                 if catalog:
+                    await _notify_progress(
+                        progress, "download", "Downloading manifest-declared agent files",
+                        files=len(selected),
+                        total_bytes=sum(entries[path].size for path in selected),
+                    )
                     await self._run_git(
                         directory, "sparse-checkout", "set", "--no-cone", "--stdin",
                         input_bytes=_sparse_checkout_input(checkout_paths),
+                    )
+                    await _notify_progress(
+                        progress, "download", "Relevant files downloaded",
+                        files=len(selected),
+                        loaded_bytes=sum(entries[path].size for path in selected),
+                        total_bytes=sum(entries[path].size for path in selected),
                     )
 
             relevant_bytes = sum(entries[path].size for path in selected)
@@ -492,6 +551,7 @@ class GitHubGateway:
 
     async def _archive_download(
         self, owner: str, repository: str, sha: str, *, preflight: bool = True,
+        progress: ProgressCallback | None = None,
     ) -> BinaryIO:
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
@@ -520,13 +580,13 @@ class GitHubGateway:
                             raise ServiceProblem(502, "unsafe_archive_redirect", "GitHub returned an unexpected archive host")
                     elif response.status_code == 200:
                         location = ""
-                        return await self._read_limited(response)
+                        return await self._read_limited(response, progress)
                     else:
                         raise ServiceProblem(502, "github_error", f"GitHub archive returned HTTP {response.status_code}")
                 async with client.stream("GET", location, headers=self._headers(False), follow_redirects=False) as archive_response:
                     if archive_response.status_code != 200:
                         raise ServiceProblem(502, "github_error", f"GitHub archive returned HTTP {archive_response.status_code}")
-                    return await self._read_limited(archive_response)
+                    return await self._read_limited(archive_response, progress)
         except ServiceProblem:
             raise
         except httpx.TimeoutException as error:
@@ -620,11 +680,15 @@ class GitHubGateway:
             )
         return blobs, len(entries) + 1
 
-    async def _read_limited(self, response: httpx.Response) -> BinaryIO:
+    async def _read_limited(
+        self, response: httpx.Response, progress: ProgressCallback | None = None,
+    ) -> BinaryIO:
         raw_length = response.headers.get("content-length")
+        expected: int | None = None
         if raw_length:
             try:
-                if int(raw_length) > self.settings.repo_archive_max_bytes:
+                expected = int(raw_length)
+                if expected > self.settings.repo_archive_max_bytes:
                     raise ServiceProblem(
                         413, "archive_too_large",
                         "repository archive exceeds the configured limit",
@@ -635,6 +699,7 @@ class GitHubGateway:
             max_size=self.settings.repo_archive_memory_bytes, mode="w+b"
         )
         total = 0
+        reported = 0
         try:
             async for chunk in response.aiter_bytes():
                 total += len(chunk)
@@ -644,6 +709,12 @@ class GitHubGateway:
                         "repository archive exceeds the configured limit",
                     )
                 output.write(chunk)
+                if total - reported >= 512 * 1024 or (expected is not None and total >= expected):
+                    reported = total
+                    await _notify_progress(
+                        progress, "download", "Downloading the bounded repository archive",
+                        loaded_bytes=total, total_bytes=expected,
+                    )
             output.seek(0)
             return output
         except BaseException:
@@ -1473,6 +1544,7 @@ class RepositoryManager:
     async def get(
         self, owner: str, repository: str, sha: str, subdirectory: str | None,
         encoding: str | None, ip: str, *, include_ip_quota: bool = True,
+        progress: ProgressCallback | None = None,
     ) -> SnapshotAnalysis:
         if not _NAME.fullmatch(owner) or not _NAME.fullmatch(repository) or not _SHA.fullmatch(sha):
             raise ServiceProblem(422, "invalid_snapshot", "invalid repository snapshot")
@@ -1490,9 +1562,13 @@ class RepositoryManager:
             "subdirectory": None,
             "html_url": f"https://github.com/{owner}/{repository}/tree/{sha.lower()}",
         })
+        await _notify_progress(progress, "cache", "Checking the repository report cache")
         key = self.cache_key(full_identity)
         cached: CachedRepository | None = await self.cache.get(key)
         if cached is not None and selected in cached.analyses:
+            await _notify_progress(
+                progress, "complete", "Cached report ready", cached=True
+            )
             return scope_analysis(cached.analyses[selected], normalized_path, cached=True)
 
         async def load() -> SnapshotAnalysis:
@@ -1506,10 +1582,23 @@ class RepositoryManager:
                     return existing
                 async with self._scan_admission():
                     await self._consume_repo_quota(ip, include_ip_quota)
+                    await _notify_progress(
+                        progress, "verify", "Verifying that the GitHub repository is public"
+                    )
                     await self._ensure_public(owner, repository)
-                    source = await self.gateway.archive(owner, repository, sha)
+                    source = (
+                        await self.gateway.archive(
+                            owner, repository, sha, progress=progress
+                        )
+                        if progress is not None
+                        else await self.gateway.archive(owner, repository, sha)
+                    )
                     handle = source.archive if isinstance(source, SnapshotSource) else source
                     try:
+                        await _notify_progress(
+                            progress, "analyze",
+                            "Discovering harness artifacts and counting tokens",
+                        )
                         result = await self._analyze_in_worker(
                             source, full_identity, selected
                         )
@@ -1524,6 +1613,10 @@ class RepositoryManager:
             result = entry.analyses.get(selected)
             if result is None:
                 base = next(iter(entry.analyses.values()))
+                await _notify_progress(
+                    progress, "analyze",
+                    f"Recounting retained components with {selected}",
+                )
                 result = await self._run_in_worker(
                     partial(retokenize_analysis, base, selected)
                 )
@@ -1536,6 +1629,7 @@ class RepositoryManager:
                 self.singleflight.run(f"{key}|{selected}", load),
                 self.settings.repo_timeout_seconds,
             )
+            await _notify_progress(progress, "complete", "Repository report ready")
             return scope_analysis(full_analysis, normalized_path, cached=False)
         except asyncio.TimeoutError as error:
             raise ServiceProblem(503, "repository_timeout", "repository analysis timed out") from error

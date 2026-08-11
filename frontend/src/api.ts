@@ -23,6 +23,8 @@ export const api = {
     request<{ canonical_path: string }>("/api/v1/repositories/resolve", json(body)),
   report: (owner: string, repository: string, sha: string, search: string) =>
     request<RepositoryReport>(`/api/v1/repositories/github/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/commits/${sha}${search}`),
+  reportProgressUrl: (owner: string, repository: string, sha: string, search: string) =>
+    `/api/v1/repositories/github/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/commits/${sha}/progress${search}`,
   nativeCount: (body: unknown) => request<{ input_tokens: number; cached: boolean; model: string }>("/api/v1/token-counts/native", json(body)),
   skills: (files: { path: string; content: string }[], encoding: string) =>
     request<SkillsResponse>("/api/v1/estimates/skills", json({ files, encoding })),

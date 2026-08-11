@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import tarfile
 import tempfile
 from dataclasses import replace
@@ -496,6 +497,49 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(repositories, "get", unexpected_get)
     conditional = request("GET", path, headers={"if-none-match": first.headers["etag"]})
     assert conditional.status_code == 304
+
+
+def test_repository_progress_stream_finishes_with_cached_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = archive({"skills/progress/SKILL.md": SKILL.encode()})
+    calls = 0
+
+    async def fake_archive(
+        owner: str, repository: str, sha: str, progress=None,
+    ) -> bytes:
+        nonlocal calls
+        calls += 1
+        if progress is not None:
+            await progress({"stage": "tree", "message": "Inspecting tree"})
+            await progress({"stage": "fetch", "message": "Fetching commit"})
+            await progress({
+                "stage": "download", "message": "Relevant files downloaded",
+                "files": 1, "loaded_bytes": len(payload), "total_bytes": len(payload),
+            })
+        return payload
+
+    monkeypatch.setattr(repositories.gateway, "archive", fake_archive)
+    sha = "6" * 40
+    base = f"/api/v1/repositories/github/progress-test/fixture/commits/{sha}"
+    streamed = request("GET", base + "/progress?encoding=o200k_base")
+    assert streamed.status_code == 200
+    assert streamed.headers["content-type"].startswith("text/event-stream")
+    assert streamed.headers["cache-control"] == "no-store"
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in streamed.text.splitlines() if line.startswith("data: ")
+    ]
+    stages = [event["stage"] for event in events]
+    assert stages == [
+        "cache", "verify", "tree", "fetch", "download", "analyze", "complete",
+    ]
+    assert events[4]["files"] == 1
+
+    report = request("GET", base + "?encoding=o200k_base")
+    assert report.status_code == 200
+    assert report.json()["cached"] is True
+    assert calls == 1
 
 
 def test_repository_discovery_is_reused_across_encodings(

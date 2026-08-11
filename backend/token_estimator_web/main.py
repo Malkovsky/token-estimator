@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .badges import BadgeStyle, token_badge_svg, token_summary_badge_svg
@@ -239,6 +239,66 @@ async def repository_report(
         owner, repository, sha, path, encoding, client_ip(raw, settings)
     )
     return JSONResponse(content=analysis.report.model_dump(mode="json"), headers=headers)
+
+
+@app.get(
+    "/api/v1/repositories/github/{owner}/{repository}/commits/{sha}/progress",
+    responses={200: {"content": {"text/event-stream": {}}}},
+    tags=["repositories"],
+)
+async def repository_progress(
+    owner: str, repository: str, sha: str, raw: Request,
+    path: str | None = None, encoding: str | None = None,
+) -> StreamingResponse:
+    """Stream real repository-analysis stages, ending when the report is cached."""
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+
+    async def progress(event: dict[str, Any]) -> None:
+        await queue.put(event)
+
+    async def analyze() -> None:
+        try:
+            await repositories.get(
+                owner, repository, sha, path, encoding, client_ip(raw, settings),
+                progress=progress,
+            )
+        except ServiceProblem as error:
+            await queue.put({
+                "stage": "error", "message": error.message, "code": error.code,
+                "status": error.status, "retry_after": error.retry_after,
+            })
+        except Exception:
+            await queue.put({
+                "stage": "error", "message": "Repository analysis failed",
+                "code": "repository_error", "status": 500,
+            })
+
+    task = asyncio.create_task(analyze())
+
+    async def events():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), 15)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                if event.get("stage") in {"complete", "error"}:
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get(

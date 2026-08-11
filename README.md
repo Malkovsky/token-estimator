@@ -138,6 +138,7 @@ curl --request POST http://localhost:8000/api/v1/repositories/resolve \
 The response contains a `canonical_path` pinned to the resolved commit. Send a `GET` request to that path to retrieve the report. Other useful endpoints are:
 
 - `GET /api/v1/capabilities` — encodings, provider availability, and deployment limits.
+- `GET /api/v1/repositories/github/{owner}/{repository}/commits/{sha}/progress` — server-sent cache, verification, tree, fetch, download, and analysis progress events.
 - `POST /api/v1/token-counts/native` — provider-native count for selected report components.
 - `POST /api/v1/estimates/skills` — skill files supplied as JSON.
 - `POST /api/v1/estimates/mcp` — MCP definitions supplied as JSON.

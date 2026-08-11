@@ -9,6 +9,17 @@ import type {
 
 type BadgeMetric = "metadata" | "total" | "summary";
 type BadgeStyle = "blueprint" | "classic" | "outline" | "capsule" | "terminal" | "paper" | "signal" | "mono" | "soft" | "minimal";
+type RepositoryProgressEvent = {
+  stage: "cache" | "verify" | "tree" | "fetch" | "download" | "analyze" | "complete" | "error";
+  message: string; files?: number; loaded_bytes?: number; total_bytes?: number;
+  code?: string; status?: number;
+};
+
+const repositoryProgressStages = [
+  ["cache", "Cache"], ["verify", "Verify"], ["tree", "Tree"],
+  ["fetch", "Commit"], ["download", "Files"], ["analyze", "Analyze"],
+  ["complete", "Ready"],
+] as const;
 
 const badgeDesigns: { id: BadgeStyle; name: string; description: string; traits: string[] }[] = [
   { id: "blueprint", name: "Blueprint", description: "The current architectural blue system with the token glyph.", traits: ["Technical", "Branded", "Crisp"] },
@@ -35,6 +46,7 @@ declare global {
 const number = (value: number | null | undefined) => value == null ? "—" : new Intl.NumberFormat().format(value);
 const title = (value: string) => value.replaceAll("_", " ");
 const badgeLabel = (metric: BadgeMetric) => metric === "summary" ? "Token summary" : metric === "metadata" ? "Metadata tokens" : "Total tokens";
+const compactBytes = (value: number) => value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`;
 
 function Shell({ children, design = CANONICAL_DESIGN, preview = false, screen = "landing" }: { children: React.ReactNode; design?: DesignId; preview?: boolean; screen?: DesignScreen }) {
   const home = preview || design !== CANONICAL_DESIGN ? designPath(design) : "/";
@@ -174,6 +186,38 @@ function InventoryCard({ item, selected, toggle }: { item: InventoryItem; select
   </article>;
 }
 
+function RepositoryProgress({ progress, error = "" }: { progress: RepositoryProgressEvent; error?: string }) {
+  const stageIndex = Math.max(0, repositoryProgressStages.findIndex(([id]) => id === progress.stage));
+  const stageLabel = repositoryProgressStages[stageIndex]?.[1] || "Repository";
+  const byteFraction = progress.stage === "download" && progress.total_bytes
+    ? Math.min(0.9, (progress.loaded_bytes || 0) / progress.total_bytes * 0.9) : 0;
+  const railProgress = Math.min(100, ((stageIndex + byteFraction) / (repositoryProgressStages.length - 1)) * 100);
+  const detail = [
+    progress.files != null ? `${number(progress.files)} relevant file${progress.files === 1 ? "" : "s"}` : "",
+    progress.total_bytes != null
+      ? progress.loaded_bytes != null && progress.loaded_bytes < progress.total_bytes
+        ? `${compactBytes(progress.loaded_bytes)} of ${compactBytes(progress.total_bytes)}`
+        : compactBytes(progress.total_bytes)
+      : "",
+  ].filter(Boolean).join(" · ");
+  return <div className={`repository-progress${error ? " has-failed" : ""}`} aria-live="polite" aria-busy={!error}>
+    <p className="eyebrow">Immutable snapshot analysis</p>
+    <h1>{error ? "Repository analysis stopped" : "Mapping repository context…"}</h1>
+    <div className="progress-rail" style={{ "--progress": `${railProgress}%` } as React.CSSProperties}>
+      <div className="progress-track"><span /></div>
+      <ol>{repositoryProgressStages.map(([id, label], index) => <li className={index < stageIndex ? "done" : index === stageIndex ? error ? "failed" : "current" : ""} key={id}>
+        <span className="stage-node" aria-hidden="true">{index < stageIndex ? "✓" : index === stageIndex && error ? "!" : String(index + 1).padStart(2, "0")}</span>
+        <span>{label}</span>
+      </li>)}</ol>
+    </div>
+    <div className={`progress-current${error ? " failed" : ""}`}>
+      <span className="progress-pulse" aria-hidden="true">{error ? "×" : ""}</span>
+      <div><strong>{error ? `Stopped at ${stageLabel}` : progress.message}</strong>{error ? <small>{error}</small> : detail && <small>{detail}</small>}</div>
+    </div>
+    <p className="progress-note">Only recognized agentic-harness text is downloaded. Repository code is never executed.</p>
+  </div>;
+}
+
 function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview = false, search }: { owner: string; repository: string; sha: string; design?: DesignId; preview?: boolean; search?: string }) {
   const [report, setReport] = useState<RepositoryReport | null>(null);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
@@ -187,19 +231,44 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
   const [busy, setBusy] = useState(true);
   const [nativeBusy, setNativeBusy] = useState(false);
   const [badgeCopied, setBadgeCopied] = useState<BadgeMetric | null>(null);
+  const [progress, setProgress] = useState<RepositoryProgressEvent>({ stage: "cache", message: "Connecting to the repository analysis stream" });
   const [error, setError] = useState("");
   const { token, reset } = useTurnstile(capabilities);
 
   useEffect(() => {
-    Promise.all([api.report(owner, repository, sha, search ?? window.location.search), api.capabilities()])
-      .then(([nextReport, nextCapabilities]) => {
+    let active = true;
+    let finished = false;
+    const query = search ?? window.location.search;
+    const capabilitiesRequest = api.capabilities();
+    const source = new EventSource(api.reportProgressUrl(owner, repository, sha, query));
+    const loadReport = () => {
+      if (finished) return;
+      finished = true;
+      source.close();
+      Promise.all([api.report(owner, repository, sha, query), capabilitiesRequest])
+      .then(([nextReport, nextCapabilities]) => { if (active) {
         setReport(nextReport); setCapabilities(nextCapabilities);
         const enabled = nextCapabilities.native_providers.find((item) => item.enabled);
         if (enabled) { setProvider(enabled.id); setModel(enabled.default_model || ""); }
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "Could not load report"))
-      .finally(() => setBusy(false));
-  }, [owner, repository, sha]);
+      }})
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load report"); })
+      .finally(() => { if (active) setBusy(false); });
+    };
+    source.onmessage = (event) => {
+      if (!active) return;
+      try {
+        const next = JSON.parse(event.data) as RepositoryProgressEvent;
+        if (next.stage === "error") {
+          finished = true; source.close(); setError(next.message); setBusy(false);
+          return;
+        }
+        setProgress(next);
+        if (next.stage === "complete") loadReport();
+      } catch { source.close(); loadReport(); }
+    };
+    source.onerror = () => { if (active) loadReport(); };
+    return () => { active = false; source.close(); };
+  }, [owner, repository, sha, search]);
 
   const providerInfo = capabilities?.native_providers.find((item) => item.id === provider);
   useEffect(() => { if (providerInfo?.enabled && !providerInfo.models.includes(model)) setModel(providerInfo.default_model || ""); }, [providerInfo, model]);
@@ -246,7 +315,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     window.setTimeout(() => setBadgeCopied(null), 1800);
   }
 
-  if (busy) return <Shell design={design} preview={preview} screen="report"><div className="state"><div className="spinner" /><h1>Inspecting repository snapshot…</h1><p>Fetching only the immutable public commit and scanning bounded text candidates.</p></div></Shell>;
+  if (busy || (!report && error)) return <Shell design={design} preview={preview} screen="report"><RepositoryProgress progress={progress} error={error} /></Shell>;
   if (!report) return <Shell design={design} preview={preview} screen="report"><div className="state"><h1>Could not load this report</h1><p className="error">{error}</p><a href={preview ? designPath(design) : "/"}>Try another repository</a></div></Shell>;
   const enabledProviders = capabilities?.native_providers.filter((item) => item.enabled) || [];
   return <Shell design={design} preview={preview} screen="report"><section className="report-header">
