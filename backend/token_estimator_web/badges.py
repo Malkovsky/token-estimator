@@ -100,13 +100,13 @@ def compact_tokens(tokens: int) -> str:
 
 def token_badge_svg(
     tokens: int | None = None,
-    label: str = "total tokens",
+    label: str = "full tokens",
     style: BadgeStyle = "blueprint",
 ) -> str:
     """Return a styled token badge, or an unavailable badge on failure."""
     visual = _VISUALS[style]
     value = compact_tokens(tokens) if tokens is not None else "unavailable"
-    label_padding = 10 if label == "metadata tokens" else 0
+    label_padding = 10 if label == "minimal tokens" else 0
     icon_width = 32 if visual.icon else 0
     label_width = max(88, 18 + icon_width + len(label) * 6 + label_padding)
     value_width = max(48, 14 + len(value) * 7)
@@ -163,33 +163,49 @@ def token_badge_svg(
 
 
 def token_summary_badge_svg(
-    metadata_tokens: int | None = None,
+    minimal_tokens: int | None = None,
+    expected_tokens: int | None = None,
     total_tokens: int | None = None,
     style: BadgeStyle = "blueprint",
 ) -> str:
-    """Return a three-segment metadata/total token summary badge."""
+    """Return an alternating Min/value, Avg/value, All/value summary badge."""
     visual = _VISUALS[style]
-    metadata = (
-        compact_tokens(metadata_tokens) if metadata_tokens is not None else "unavailable"
+    minimal = (
+        compact_tokens(minimal_tokens) if minimal_tokens is not None else "unavailable"
+    )
+    expected = (
+        compact_tokens(expected_tokens) if expected_tokens is not None else "unavailable"
     )
     total = compact_tokens(total_tokens) if total_tokens is not None else "unavailable"
     icon_width = 32 if visual.icon else 0
-    label_width = max(78, 18 + icon_width + len("tokens") * 6)
-    metadata_width = max(48, 14 + len(metadata) * 7)
-    total_width = max(48, 14 + len(total) * 7)
-    total_start = label_width + metadata_width
+    minimal_label_width = max(34 + icon_width, 8 + icon_width + len("Min") * 6)
+    expected_label_width = max(34, 8 + len("Avg") * 6)
+    total_label_width = max(34, 8 + len("All") * 6)
+    minimal_width = max(36, 8 + len(minimal) * 7)
+    expected_width = max(36, 8 + len(expected) * 7)
+    total_width = max(36, 8 + len(total) * 7)
+    minimal_start = minimal_label_width
+    expected_label_start = minimal_start + minimal_width
+    expected_start = expected_label_start + expected_label_width
+    total_label_start = expected_start + expected_width
+    total_start = total_label_start + total_label_width
     width = total_start + total_width
-    label_center = icon_width + (label_width - icon_width) / 2
-    metadata_center = label_width + metadata_width / 2
+    minimal_label_center = icon_width + (minimal_label_width - icon_width) / 2
+    minimal_center = minimal_start + minimal_width / 2
+    expected_label_center = expected_label_start + expected_label_width / 2
+    expected_center = expected_start + expected_width / 2
+    total_label_center = total_label_start + total_label_width / 2
     total_center = total_start + total_width / 2
     baseline = visual.height / 2 + 4
     accessible = escape(
-        f"tokens: metadata {metadata}, total {total}", quote=True
+        f"tokens: min {minimal}, avg {expected}, all {total}", quote=True
     )
-    metadata_fill = visual.value_fill if metadata_tokens is not None else "#a33a3a"
-    metadata_text = visual.value_text if metadata_tokens is not None else "#fff"
-    total_fill = visual.label_fill if total_tokens is not None else "#a33a3a"
-    total_text = visual.label_text if total_tokens is not None else "#fff"
+    minimal_fill = visual.value_fill if minimal_tokens is not None else "#a33a3a"
+    minimal_text = visual.value_text if minimal_tokens is not None else "#fff"
+    expected_fill = visual.value_fill if expected_tokens is not None else "#a33a3a"
+    expected_text = visual.value_text if expected_tokens is not None else "#fff"
+    total_fill = visual.value_fill if total_tokens is not None else "#a33a3a"
+    total_text = visual.value_text if total_tokens is not None else "#fff"
     shine = (
         f'<rect width="{width}" height="{visual.height}" fill="url(#s)"/>'
         if visual.shine else ""
@@ -200,8 +216,12 @@ def token_summary_badge_svg(
         if visual.border else ""
     )
     divider_stroke = visual.border or "#fff"
+    boundaries = (
+        minimal_start, expected_label_start, expected_start,
+        total_label_start, total_start,
+    )
     dividers = (
-        f'<path d="M{label_width} 1v{visual.height - 2}M{total_start} 1v{visual.height - 2}" '
+        f'<path d="{"".join(f"M{boundary} 1v{visual.height - 2}" for boundary in boundaries)}" '
         f'stroke="{divider_stroke}" stroke-opacity=".45"/>'
     )
     icon_panel = (
@@ -224,15 +244,21 @@ def token_summary_badge_svg(
   </linearGradient>
   <clipPath id="r"><rect width="{width}" height="{visual.height}" rx="{visual.radius}"/></clipPath>
   <g clip-path="url(#r)">
-    <rect width="{label_width}" height="{visual.height}" fill="{visual.label_fill}"/>
-    <rect x="{label_width}" width="{metadata_width}" height="{visual.height}" fill="{metadata_fill}"/>
+    <rect width="{minimal_label_width}" height="{visual.height}" fill="{visual.label_fill}"/>
+    <rect x="{minimal_start}" width="{minimal_width}" height="{visual.height}" fill="{minimal_fill}"/>
+    <rect x="{expected_label_start}" width="{expected_label_width}" height="{visual.height}" fill="{visual.label_fill}"/>
+    <rect x="{expected_start}" width="{expected_width}" height="{visual.height}" fill="{expected_fill}"/>
+    <rect x="{total_label_start}" width="{total_label_width}" height="{visual.height}" fill="{visual.label_fill}"/>
     <rect x="{total_start}" width="{total_width}" height="{visual.height}" fill="{total_fill}"/>
     {icon_panel}{shine}{dividers}{icon}
   </g>
   {border}
   <g text-anchor="middle" font-family="{visual.font}" font-size="11">
-    <text x="{label_center:g}" y="{baseline:g}" fill="{visual.label_text}">tokens</text>
-    <text x="{metadata_center:g}" y="{baseline:g}" fill="{metadata_text}" font-weight="700">{escape(metadata)}</text>
+    <text x="{minimal_label_center:g}" y="{baseline:g}" fill="{visual.label_text}">Min</text>
+    <text x="{minimal_center:g}" y="{baseline:g}" fill="{minimal_text}" font-weight="700">{escape(minimal)}</text>
+    <text x="{expected_label_center:g}" y="{baseline:g}" fill="{visual.label_text}">Avg</text>
+    <text x="{expected_center:g}" y="{baseline:g}" fill="{expected_text}" font-weight="700">{escape(expected)}</text>
+    <text x="{total_label_center:g}" y="{baseline:g}" fill="{visual.label_text}">All</text>
     <text x="{total_center:g}" y="{baseline:g}" fill="{total_text}" font-weight="700">{escape(total)}</text>
   </g>
 </svg>'''

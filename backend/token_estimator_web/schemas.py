@@ -76,6 +76,7 @@ class McpRecord(ApiModel):
     definition: int = Field(ge=0)
     name_tokens: int = Field(default=0, ge=0)
     discovery_tokens: int = Field(default=0, ge=0)
+    activation_tokens: int = Field(default=0, ge=0)
     output_schema_tokens: int = Field(default=0, ge=0)
     details_tokens: int = Field(default=0, ge=0)
 
@@ -203,6 +204,7 @@ class McpToolBreakdown(ApiModel):
     description: int = Field(ge=0)
     discovery: int = Field(ge=0)
     input_schema: int = Field(ge=0)
+    activation: int = Field(ge=0)
     output_schema: int = Field(default=0, ge=0)
     details: int = Field(default=0, ge=0)
     definition: int = Field(ge=0)
@@ -245,6 +247,7 @@ class RepositoryReport(ApiModel):
     analyzer_version: str
     inventory: list[InventoryItem]
     metadata_tokens: int = Field(ge=0)
+    activation_tokens: int = Field(ge=0)
     category_totals: dict[str, int]
     warnings: list[ScanWarning]
     scan: ScanStats

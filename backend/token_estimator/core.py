@@ -49,6 +49,7 @@ class McpUsage:
     description: int
     discovery: int
     schema: int
+    activation: int
     output_schema: int
     details: int
     definition: int
@@ -61,6 +62,7 @@ class CanonicalMcpTool:
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None
     details: dict[str, Any]
+    activation_definition: dict[str, Any]
     definition: dict[str, Any]
 
 
@@ -296,6 +298,11 @@ def canonicalize_tool(tool: dict[str, Any]) -> CanonicalMcpTool:
         input_schema=input_schema,
         output_schema=output_schema,
         details=details,
+        activation_definition={
+            "name": name,
+            "description": description,
+            "inputSchema": input_schema,
+        },
         definition=definition,
     )
 
@@ -323,6 +330,7 @@ def measure_mcp_documents(
                     description=description_tokens,
                     discovery=name_tokens + description_tokens,
                     schema=count(compact_json(tool.input_schema)),
+                    activation=count(compact_json(tool.activation_definition)),
                     output_schema=(
                         count(compact_json(tool.output_schema))
                         if tool.output_schema is not None else 0

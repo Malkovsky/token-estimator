@@ -102,6 +102,7 @@ def estimate_mcp(request: McpRequest, settings: Settings) -> McpResponse:
                 name=usage.name, encoding=encoding, description=usage.description,
                 schema_tokens=usage.schema, definition=usage.definition,
                 name_tokens=usage.name_tokens, discovery_tokens=usage.discovery,
+                activation_tokens=usage.activation,
                 output_schema_tokens=usage.output_schema,
                 details_tokens=usage.details,
             ))
@@ -111,6 +112,7 @@ def estimate_mcp(request: McpRequest, settings: Settings) -> McpResponse:
         method=method_info(encoding), records=records,
         totals={
             "discovery": sum(item.discovery_tokens for item in records),
+            "activation": sum(item.activation_tokens for item in records),
             "description": sum(item.description for item in records),
             "schema": sum(item.schema_tokens for item in records),
             "output_schema": sum(item.output_schema_tokens for item in records),

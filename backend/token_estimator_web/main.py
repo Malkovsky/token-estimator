@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .badges import BadgeStyle, token_badge_svg, token_summary_badge_svg
@@ -220,6 +220,29 @@ async def resolve_repository(request: RepositoryResolveRequest, raw: Request) ->
 
 
 @app.get(
+    "/github/{owner}/{repository}/latest",
+    responses={307: {"description": "Redirect to the current immutable report"}},
+    tags=["repositories"],
+)
+async def latest_repository_report(
+    owner: str, repository: str, raw: Request,
+    ref: str | None = None, path: str | None = None, encoding: str | None = None,
+) -> RedirectResponse:
+    """Resolve a moving repository reference and redirect to its immutable report."""
+    resolved = await repositories.resolve(
+        RepositoryResolveRequest(
+            repository=f"{owner}/{repository}", ref=ref,
+            subdirectory=path, encoding=encoding,
+        ),
+        client_ip(raw, settings),
+    )
+    return RedirectResponse(
+        resolved.canonical_path, status_code=307,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
     "/api/v1/repositories/github/{owner}/{repository}/commits/{sha}",
     response_model=RepositoryReport, responses=ERROR_RESPONSES, tags=["repositories"],
 )
@@ -325,12 +348,13 @@ async def repository_badge(
         )
         content = (
             token_summary_badge_svg(
-                summary.metadata_tokens, summary.total_tokens, style
+                summary.metadata_tokens, summary.activation_tokens,
+                summary.total_tokens, style
             )
             if metric == "summary"
             else token_badge_svg(
                 summary.metadata_tokens if metric == "metadata" else summary.total_tokens,
-                "metadata tokens" if metric == "metadata" else "total tokens",
+                "minimal tokens" if metric == "metadata" else "full tokens",
                 style,
             )
         )
@@ -349,7 +373,7 @@ async def repository_badge(
                 if metric == "summary"
                 else token_badge_svg(
                     label=(
-                        "metadata tokens" if metric == "metadata" else "total tokens"
+                        "minimal tokens" if metric == "metadata" else "full tokens"
                     ),
                     style=style,
                 )
@@ -366,12 +390,12 @@ async def badge_preview(
     """Render deterministic samples for the local badge design gallery."""
     if metric == "summary":
         return Response(
-            content=token_summary_badge_svg(11_270, 814_027, style),
+            content=token_summary_badge_svg(11_270, 126_400, 814_027, style),
             media_type="image/svg+xml",
             headers={"Cache-Control": "no-store"},
         )
     tokens = 11_270 if metric == "metadata" else 814_027
-    label = "metadata tokens" if metric == "metadata" else "total tokens"
+    label = "minimal tokens" if metric == "metadata" else "full tokens"
     return Response(
         content=token_badge_svg(tokens, label, style), media_type="image/svg+xml",
         headers={"Cache-Control": "no-store"},

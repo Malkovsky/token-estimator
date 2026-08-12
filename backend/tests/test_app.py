@@ -99,18 +99,21 @@ def test_token_badge_formatting() -> None:
     assert compact_tokens(1_250) == "1.2k"
     assert compact_tokens(572_949) == "573k"
     assert compact_tokens(1_250_000) == "1.2M"
-    svg = token_badge_svg(572_949, "total tokens")
-    assert 'aria-label="total tokens: 573k"' in svg
+    svg = token_badge_svg(572_949, "full tokens")
+    assert 'aria-label="full tokens: 573k"' in svg
     assert "#145eb5" in svg
-    assert "unavailable" in token_badge_svg(label="metadata tokens")
-    summary = token_summary_badge_svg(11_270, 814_027)
-    assert 'aria-label="tokens: metadata 11k, total 814k"' in summary
-    assert ">tokens</text>" in summary
-    assert summary.count('font-weight="700"') == 2
+    assert "unavailable" in token_badge_svg(label="minimal tokens")
+    summary = token_summary_badge_svg(11_270, 126_400, 814_027)
+    assert 'aria-label="tokens: min 11k, avg 126k, all 814k"' in summary
+    assert ">Min</text>" in summary
+    assert ">Avg</text>" in summary
+    assert ">All</text>" in summary
+    assert summary.count('font-weight="700"') == 3
+    assert 'width="242"' in summary
     assert "unavailable" in token_summary_badge_svg()
     for style in BADGE_STYLES:
-        styled = token_badge_svg(11_270, "metadata tokens", style)
-        assert 'aria-label="metadata tokens: 11k"' in styled
+        styled = token_badge_svg(11_270, "minimal tokens", style)
+        assert 'aria-label="minimal tokens: 11k"' in styled
         assert styled.startswith("<svg")
         if style not in {"classic", "minimal"}:
             assert '<rect width="32"' in styled
@@ -124,10 +127,10 @@ def test_badge_design_preview_endpoints() -> None:
         response = request("GET", f"/badge/preview/{style}/metadata.svg")
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("image/svg+xml")
-        assert "metadata tokens: 11k" in response.text
+        assert "minimal tokens: 11k" in response.text
         summary = request("GET", f"/badge/preview/{style}/summary.svg")
         assert summary.status_code == 200
-        assert "tokens: metadata 11k, total 814k" in summary.text
+        assert "tokens: min 11k, avg 126k, all 814k" in summary.text
 
 
 def test_legacy_skill_mcp_and_scenario() -> None:
@@ -153,6 +156,12 @@ def test_legacy_skill_mcp_and_scenario() -> None:
     assert mcp_record["output_schema_tokens"] > 0
     assert mcp_record["details_tokens"] > 0
     assert mcp["totals"]["discovery"] == mcp_record["discovery_tokens"]
+    assert mcp["totals"]["activation"] == mcp_record["activation_tokens"]
+    assert (
+        mcp_record["discovery_tokens"]
+        < mcp_record["activation_tokens"]
+        < mcp_record["definition"]
+    )
     assert mcp["totals"]["definition"] == mcp_record["definition"]
     scenario = request(
         "POST", "/api/v1/scenarios/estimate",
@@ -169,6 +178,9 @@ def test_repository_locator_validation() -> None:
     assert parse_repository("openai/codex") == ("openai", "codex")
     assert parse_repository("https://github.com/openai/codex.git") == ("openai", "codex")
     assert parse_repository("https://github.com/openai/codex/tree/main/codex-rs") == ("openai", "codex")
+    assert parse_repository(
+        f"https://github.com/openai/codex/commit/{'a' * 40}"
+    ) == ("openai", "codex")
     with pytest.raises(Exception):
         parse_repository("https://example.com/openai/codex")
     with pytest.raises(Exception):
@@ -191,6 +203,7 @@ def test_resolve_creates_commit_canonical_path_and_rejects_private(monkeypatch: 
     assert resolved.repository.commit_sha == "d" * 40
     assert resolved.canonical_path.startswith("/github/Acme/Repo/commit/")
     assert "path=skills" in resolved.canonical_path
+    assert "ref=" not in resolved.canonical_path
 
     folder = asyncio.run(gateway.resolve(
         RepositoryResolveRequest(
@@ -200,7 +213,16 @@ def test_resolve_creates_commit_canonical_path_and_rejects_private(monkeypatch: 
     assert folder.requested_ref == "release"
     assert folder.repository.subdirectory == "skills/demo"
     assert "path=skills%2Fdemo" in folder.canonical_path
+    assert "ref=release" in folder.canonical_path
     assert folder.repository.html_url.endswith("/skills/demo")
+
+    commit = asyncio.run(gateway.resolve(
+        RepositoryResolveRequest(
+            repository=f"https://github.com/acme/repo/commit/{'b' * 40}"
+        ), settings
+    ))
+    assert commit.requested_ref == "b" * 40
+    assert f"ref={'b' * 40}" in commit.canonical_path
 
     async def private_json(_: str) -> dict[str, object]:
         return {"private": True, "visibility": "private", "default_branch": "main"}
@@ -249,6 +271,50 @@ def test_repository_resolution_is_cached(monkeypatch: pytest.MonkeyPatch) -> Non
     assert resolution_quota_calls == 1
 
 
+def test_latest_report_redirects_to_the_resolved_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sha = "8" * 40
+    received: list[tuple[RepositoryResolveRequest, str]] = []
+
+    async def fake_resolve(
+        payload: RepositoryResolveRequest, ip_address: str,
+    ) -> RepositoryResolveResponse:
+        received.append((payload, ip_address))
+        return RepositoryResolveResponse(
+            repository=RepositoryIdentity(
+                owner="Acme", name="Repo", commit_sha=sha,
+                html_url=f"https://github.com/Acme/Repo/tree/{sha}/skills/demo",
+                subdirectory=payload.subdirectory,
+            ),
+            requested_ref=payload.ref or "main",
+            canonical_path=(
+                f"/github/Acme/Repo/commit/{sha}"
+                "?encoding=cl100k_base&path=skills%2Fdemo"
+            ),
+        )
+
+    monkeypatch.setattr(repositories, "resolve", fake_resolve)
+    response = request(
+        "GET",
+        "/github/acme/repo/latest?encoding=cl100k_base&path=skills%2Fdemo",
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == (
+        f"/github/Acme/Repo/commit/{sha}"
+        "?encoding=cl100k_base&path=skills%2Fdemo"
+    )
+    assert response.headers["cache-control"] == "no-store"
+    assert len(received) == 1
+    payload, ip_address = received[0]
+    assert payload.repository == "acme/repo"
+    assert payload.ref is None
+    assert payload.subdirectory == "skills/demo"
+    assert payload.encoding == "cl100k_base"
+    assert ip_address
+
+
 def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> None:
     settings = Settings.from_env()
     identity = RepositoryIdentity(
@@ -287,6 +353,17 @@ def test_archive_inventory_deduplicates_skill_resources_and_redacts_mcp() -> Non
     assert result.report.metadata_tokens == (
         counter("demo") + counter("Demonstrate a compact workflow.")
     )
+    skill = by_kind["skill"][0]
+    expected_activation = sum(
+        component.tokens for component in skill.components
+        if component.role in {"metadata", "body"}
+    )
+    assert result.report.activation_tokens == (
+        expected_activation
+        + by_kind["instruction"][0].tokens
+        + by_kind["rule"][0].tokens
+    )
+    assert result.report.activation_tokens < result.report.category_totals["all_discovered_text"]
     serialized = result.report.model_dump_json()
     assert "secret-command" not in serialized
     assert "https://secret" not in serialized
@@ -348,14 +425,22 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
     details_text = json.dumps({
         "title": "Search", "annotations": {"readOnlyHint": True},
     }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    activation_text = json.dumps({
+        "name": "search",
+        "description": "Search indexed symbols.",
+        "inputSchema": snapshot["tools"][0]["inputSchema"],
+    }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     assert breakdown.name == counter("search")
     assert breakdown.description == counter("Search indexed symbols.")
     assert breakdown.discovery == breakdown.name + breakdown.description
     assert breakdown.input_schema == counter(schema_text)
+    assert breakdown.activation == counter(activation_text)
     assert breakdown.output_schema == counter(output_schema_text)
     assert breakdown.details == counter(details_text)
     assert breakdown.definition == tool.tokens
     assert result.report.metadata_tokens == breakdown.discovery
+    assert result.report.activation_tokens == breakdown.activation
+    assert breakdown.discovery < breakdown.activation < breakdown.definition
     assert result.report.category_totals["mcp_tool"] == tool.tokens
     assert result.report.category_totals["all_discovered_text"] == tool.tokens
     assert result.report.scan.relevant_files == 1
@@ -382,12 +467,14 @@ def test_repository_counts_committed_mcp_tools_snapshot() -> None:
         retokenized_breakdown.name + retokenized_breakdown.description
     )
     assert retokenized_breakdown.input_schema == cl100k(schema_text)
+    assert retokenized_breakdown.activation == cl100k(activation_text)
     assert retokenized_breakdown.output_schema == cl100k(output_schema_text)
     assert retokenized_breakdown.details == cl100k(details_text)
     assert retokenized_breakdown.definition == retokenized_tool.tokens
     assert retokenized.report.metadata_tokens == (
         retokenized_breakdown.discovery
     )
+    assert retokenized.report.activation_tokens == retokenized_breakdown.activation
 
 
 def test_repository_warns_when_mcp_implementation_has_no_tool_snapshot() -> None:
@@ -643,7 +730,11 @@ def test_repository_report_api_and_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["mode"] == "repository"
-    assert 0 < first.json()["metadata_tokens"] < first.json()["category_totals"]["all_discovered_text"]
+    assert (
+        0 < first.json()["metadata_tokens"]
+        < first.json()["activation_tokens"]
+        <= first.json()["category_totals"]["all_discovered_text"]
+    )
     assert second.json()["cached"] is True
     assert calls == 1
     assert first.headers["etag"].startswith('W/"')
@@ -741,6 +832,7 @@ def test_repository_discovery_is_reused_across_encodings(
         assert derived.report.method.encoding == "cl100k_base"
         assert derived.report.category_totals == direct.report.category_totals
         assert derived.report.metadata_tokens == direct.report.metadata_tokens
+        assert derived.report.activation_tokens == direct.report.activation_tokens
         assert derived.report.cached is False
         assert cached.report.cached is True
     finally:
@@ -831,10 +923,11 @@ def test_repository_badge_uses_repository_analysis(monkeypatch: pytest.MonkeyPat
     assert total.headers["x-repository-commit"] == sha
     assert total.headers["x-badge-metric"] == "total"
     assert summary.headers["x-badge-metric"] == "summary"
-    assert "total tokens" in total.text
-    assert "metadata tokens" in metadata.text
-    assert "tokens: metadata" in summary.text
-    assert ", total " in summary.text
+    assert "full tokens" in total.text
+    assert "minimal tokens" in metadata.text
+    assert "tokens: min" in summary.text
+    assert ", avg " in summary.text
+    assert ", all " in summary.text
     assert total.text != metadata.text
     assert "unavailable" not in total.text + metadata.text + summary.text
     assert resolve_calls == 0

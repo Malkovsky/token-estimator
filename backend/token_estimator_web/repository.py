@@ -137,6 +137,7 @@ class GitTreeEntry:
 class BadgeSummary:
     commit_sha: str
     metadata_tokens: int
+    activation_tokens: int
     total_tokens: int
     mutable_ref: bool
 
@@ -178,13 +179,16 @@ def parse_repository_location(value: str) -> RepositoryLocation:
             raise ServiceProblem(422, "invalid_repository", "GitHub repository URL is incomplete")
         tail = parts[2:]
         if tail:
-            if len(tail) < 2 or tail[0] != "tree":
+            if len(tail) == 2 and tail[0] == "commit" and _SHA.fullmatch(tail[1]):
+                embedded_ref = tail[1]
+            elif len(tail) >= 2 and tail[0] == "tree":
+                embedded_ref = tail[1]
+                embedded_subdirectory = "/".join(tail[2:]) or None
+            else:
                 raise ServiceProblem(
                     422, "invalid_repository",
-                    "use a GitHub repository URL or a /tree/<ref>/<folder> URL",
+                    "use a GitHub repository URL, /tree/<ref>/<folder>, or /commit/<sha>",
                 )
-            embedded_ref = tail[1]
-            embedded_subdirectory = "/".join(tail[2:]) or None
         parts = parts[:2]
     else:
         parts = [part for part in raw.split("/") if part]
@@ -279,7 +283,8 @@ class GitHubGateway:
         owner, repository = location.owner, location.repository
         metadata = await self.public_metadata(owner, repository)
         default_branch = metadata.get("default_branch")
-        requested_ref = request.ref or location.ref or (
+        explicit_ref = request.ref or location.ref
+        requested_ref = explicit_ref or (
             default_branch if isinstance(default_branch, str) else "HEAD"
         )
         if not requested_ref or len(requested_ref) > 250 or "\x00" in requested_ref:
@@ -300,6 +305,8 @@ class GitHubGateway:
         query = {"encoding": encoding}
         if subdirectory:
             query["path"] = subdirectory
+        if explicit_ref:
+            query["ref"] = explicit_ref
         canonical = (
             f"/github/{quote(str(canonical_owner))}/{quote(str(canonical_name))}/commit/{sha}"
             f"?{urlencode(query)}"
@@ -1089,6 +1096,7 @@ def _mcp_snapshot_inventory(
             compact_json(tool.output_schema) if tool.output_schema is not None else ""
         )
         details_text = compact_json(tool.details) if tool.details else ""
+        activation_definition = compact_json(tool.activation_definition)
         definition = compact_json(tool.definition)
         name_tokens = counter(tool.name)
         description_tokens = counter(tool.description)
@@ -1112,13 +1120,14 @@ def _mcp_snapshot_inventory(
                 description=description_tokens,
                 discovery=name_tokens + description_tokens,
                 input_schema=counter(schema_text),
+                activation=counter(activation_definition),
                 output_schema=(counter(output_schema_text) if output_schema_text else 0),
                 details=counter(details_text) if details_text else 0,
                 definition=component.tokens,
             ),
             accounting_note=(
                 f"Generated tools/list snapshot for {server_name}. The full definition "
-                "includes discovery metadata, input and output schemas, title, and standard "
+                "includes minimal metadata, input and output schemas, title, and standard "
                 "annotations when present. Breakdown values are explanatory and non-additive; "
                 "icons, _meta, arbitrary extensions, and runtime tool results are excluded."
             ),
@@ -1153,6 +1162,24 @@ def _discovery_token_total(
             total += sum(explicit)
         else:
             total += counter(item.name or "") + counter(item.description or "")
+    return total
+
+
+def _activation_token_total(inventory: list[InventoryItem]) -> int:
+    """Count the transparent default profile normally needed to use each artifact."""
+    total = 0
+    for item in inventory:
+        if item.kind == "mcp_config":
+            continue
+        if item.kind == "skill":
+            total += sum(
+                component.tokens for component in item.components
+                if component.role in {"metadata", "body"}
+            )
+        elif item.kind == "mcp_tool" and item.mcp_tool_breakdown is not None:
+            total += item.mcp_tool_breakdown.activation
+        elif item.tokens is not None:
+            total += item.tokens
     return total
 
 
@@ -1217,6 +1244,7 @@ def scope_analysis(
         "metadata_tokens": _discovery_token_total(
             inventory, counter_for(analysis.report.method.encoding)
         ),
+        "activation_tokens": _activation_token_total(inventory),
         "category_totals": totals,
         "scan": analysis.report.scan.model_copy(update={
             "relevant_files": len(scoped_file_bytes),
@@ -1445,7 +1473,7 @@ def analyze_archive(
                 id=_stable_id(path, kind), path=path, kind=kind, harnesses=harnesses,
                 load_policy=policy, components=components, mcp_servers=servers,
                 accounting_note=(
-                    "Connection configuration is excluded from full content totals; "
+                    "Connection configuration is excluded from full-context totals; "
                     "tool schemas are unavailable without contacting the server."
                 ),
             ))
@@ -1480,7 +1508,9 @@ def analyze_archive(
     totals["all_discovered_text"] = sum(totals.values())
     report = RepositoryReport(
         repository=identity, method=method_info(encoding), analyzer_version=settings.analyzer_version,
-        inventory=inventory, metadata_tokens=_discovery_token_total(inventory, counter),
+        inventory=inventory,
+        metadata_tokens=_discovery_token_total(inventory, counter),
+        activation_tokens=_activation_token_total(inventory),
         category_totals=totals,
         warnings=_aggregate_warnings(warnings),
         scan=ScanStats(
@@ -1540,6 +1570,11 @@ def retokenize_analysis(
                 description=description_tokens,
                 discovery=name_tokens + description_tokens,
                 input_schema=counter(compact_json(schema)),
+                activation=counter(compact_json({
+                    "name": item.name or "",
+                    "description": item.description or "",
+                    "inputSchema": schema,
+                })),
                 output_schema=(
                     counter(compact_json(output_schema))
                     if isinstance(output_schema, dict) else 0
@@ -1562,6 +1597,7 @@ def retokenize_analysis(
         "method": method_info(encoding),
         "inventory": inventory,
         "metadata_tokens": _discovery_token_total(inventory, counter),
+        "activation_tokens": _activation_token_total(inventory),
         "category_totals": totals,
         "cached": False,
     })
@@ -1727,6 +1763,7 @@ class RepositoryManager:
             return BadgeSummary(
                 commit_sha=cached.commit_sha,
                 metadata_tokens=cached.metadata_tokens,
+                activation_tokens=cached.activation_tokens,
                 total_tokens=cached.total_tokens,
                 mutable_ref=mutable_ref,
             )
@@ -1742,6 +1779,7 @@ class RepositoryManager:
         summary = BadgeSummary(
             commit_sha=sha,
             metadata_tokens=analysis.report.metadata_tokens,
+            activation_tokens=analysis.report.activation_tokens,
             total_tokens=analysis.report.category_totals.get("all_discovered_text", 0),
             mutable_ref=mutable_ref,
         )

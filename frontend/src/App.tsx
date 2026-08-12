@@ -45,7 +45,7 @@ declare global {
 
 const number = (value: number | null | undefined) => value == null ? "—" : new Intl.NumberFormat().format(value);
 const title = (value: string) => value.replaceAll("_", " ");
-const badgeLabel = (metric: BadgeMetric) => metric === "summary" ? "Token summary" : metric === "metadata" ? "Metadata tokens" : "Total tokens";
+const badgeLabel = (metric: BadgeMetric) => metric === "summary" ? "Token summary" : metric === "metadata" ? "Minimal tokens" : "Full tokens";
 const compactBytes = (value: number) => value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`;
 
 function Shell({ children, design = CANONICAL_DESIGN, preview = false, screen = "landing" }: { children: React.ReactNode; design?: DesignId; preview?: boolean; screen?: DesignScreen }) {
@@ -93,14 +93,14 @@ function BadgeDesignGallery() {
   return <Shell><section className="badge-gallery-header">
     <p className="eyebrow">Ten directions · three badge formats</p>
     <h1>Choose the badge system.</h1>
-    <p className="lede">Every variant is a production-ready SVG using the same metadata and total token values. The existing Blueprint badge remains the default while you compare them.</p>
+    <p className="lede">Every variant is a production-ready SVG using the same minimal and full token values. The existing Blueprint badge remains the default while you compare them.</p>
   </section>
   <section className="badge-design-gallery">{badgeDesigns.map((design, index) => <article className="badge-design-card" key={design.id}>
     <div className="badge-design-title"><span>{String(index + 1).padStart(2, "0")}</span><div><h2>{design.name}</h2><p>{design.description}</p></div></div>
     <div className={`badge-preview-surface badge-preview-${design.id}`}>
-      <img src={`/badge/preview/${design.id}/summary.svg?v=3`} alt={`${design.name} token summary badge`} />
-      <img src={`/badge/preview/${design.id}/metadata.svg?v=2`} alt={`${design.name} metadata token badge`} />
-      <img src={`/badge/preview/${design.id}/total.svg?v=2`} alt={`${design.name} total token badge`} />
+      <img src={`/badge/preview/${design.id}/summary.svg?v=4`} alt={`${design.name} token summary badge`} />
+      <img src={`/badge/preview/${design.id}/metadata.svg?v=2`} alt={`${design.name} minimal token badge`} />
+      <img src={`/badge/preview/${design.id}/total.svg?v=2`} alt={`${design.name} full token badge`} />
     </div>
     <div className="trait-list">{design.traits.map((trait) => <span key={trait}>{trait}</span>)}</div>
   </article>)}</section></Shell>;
@@ -178,10 +178,10 @@ function InventoryCard({ item, selected, toggle }: { item: InventoryItem; select
   return <article className="inventory-card">
     <div className="inventory-heading"><div><div className="badges"><span>{title(item.kind)}</span>{item.harnesses.map((harness) => <span key={harness} className="muted-badge">{title(harness)}</span>)}</div><h3>{item.path}</h3>{item.description && <p className="metadata-description">{item.description}</p>}</div><strong>{number(item.tokens)} <small>tokens</small></strong></div>
     {item.mcp_tool_breakdown && <div className="mcp-breakdown">
-      <span className="discovery-total"><small>Discovery metadata</small><strong>{number(item.mcp_tool_breakdown.discovery)}</strong><em>Name {number(item.mcp_tool_breakdown.name)} · description {number(item.mcp_tool_breakdown.description)}</em></span>
-      <span><small>Input schema</small><strong>{number(item.mcp_tool_breakdown.input_schema)}</strong></span>
-      <span><small>Output + details</small><strong>{number(item.mcp_tool_breakdown.output_schema + item.mcp_tool_breakdown.details)}</strong><em>Output {number(item.mcp_tool_breakdown.output_schema)} · details {number(item.mcp_tool_breakdown.details)}</em></span>
-      <span className="definition-total"><small>Full definition</small><strong>{number(item.mcp_tool_breakdown.definition)}</strong></span>
+      <span className="discovery-total"><small>Minimal</small><strong>{number(item.mcp_tool_breakdown.discovery)}</strong><em>Name {number(item.mcp_tool_breakdown.name)} · description {number(item.mcp_tool_breakdown.description)}</em></span>
+      <span className="activation-total"><small>Expected</small><strong>{number(item.mcp_tool_breakdown.activation)}</strong><em>Canonical name, description, and input schema</em></span>
+      <span><small>Optional context</small><strong>{number(item.mcp_tool_breakdown.output_schema + item.mcp_tool_breakdown.details)}</strong><em>Output schema {number(item.mcp_tool_breakdown.output_schema)} · details {number(item.mcp_tool_breakdown.details)}</em></span>
+      <span className="definition-total"><small>Full</small><strong>{number(item.mcp_tool_breakdown.definition)}</strong></span>
     </div>}
     {item.components.length > 0 && <div className="components">{item.components.map((component) => <label key={component.id}>
       <input type="checkbox" checked={selected.has(component.id)} onChange={() => toggle(component.id)} />
@@ -236,7 +236,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
   const [nativeResult, setNativeResult] = useState<{ input_tokens: number; cached: boolean; model: string } | null>(null);
   const [busy, setBusy] = useState(true);
   const [nativeBusy, setNativeBusy] = useState(false);
-  const [badgeCopied, setBadgeCopied] = useState<BadgeMetric | null>(null);
+  const [badgeCopied, setBadgeCopied] = useState<string | null>(null);
   const [progress, setProgress] = useState<RepositoryProgressEvent>({ stage: "cache", message: "Connecting to the repository analysis stream" });
   const [error, setError] = useState("");
   const { token, reset } = useTurnstile(capabilities);
@@ -283,6 +283,7 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
   const filtered = useMemo(() => report?.inventory.filter((item) =>
     (kind === "all" || item.kind === kind) && (harness === "all" || item.harnesses.includes(harness)) && item.path.toLowerCase().includes(query.toLowerCase())
   ) || [], [report, kind, harness, query]);
+  const badgeReference = new URLSearchParams(search ?? window.location.search).get("ref");
   const toggle = (id: string) => setSelected((current) => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; });
 
   async function nativeCount() {
@@ -306,17 +307,29 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     if (!report) return "";
     const badge = new URL(`/badge/github/${encodeURIComponent(report.repository.owner)}/${encodeURIComponent(report.repository.name)}.svg`, window.location.origin);
     badge.searchParams.set("metric", metric);
-    badge.searchParams.set("ref", report.repository.commit_sha);
+    if (badgeReference) badge.searchParams.set("ref", badgeReference);
     badge.searchParams.set("encoding", report.method.encoding);
-    badge.searchParams.set("v", report.analyzer_version);
+    badge.searchParams.set("v", `${report.analyzer_version}-badge3`);
     if (report.repository.subdirectory) badge.searchParams.set("path", report.repository.subdirectory);
     return badge.toString();
+  }
+
+  function badgeReportUrl() {
+    if (!report) return "";
+    const path = `/github/${encodeURIComponent(report.repository.owner)}/${encodeURIComponent(report.repository.name)}/latest`;
+    const target = new URL(path, window.location.origin);
+    if (badgeReference) target.searchParams.set("ref", badgeReference);
+    target.searchParams.set("encoding", report.method.encoding);
+    if (report.repository.subdirectory) target.searchParams.set("path", report.repository.subdirectory);
+    return target.toString();
   }
 
   async function copyBadge(metric: BadgeMetric) {
     if (!report) return;
     const label = badgeLabel(metric);
-    await navigator.clipboard.writeText(`[![${label}](${badgeUrl(metric)})](${window.location.href})`);
+    await navigator.clipboard.writeText(
+      `[![${label}](${badgeUrl(metric)})](${badgeReportUrl()})`,
+    );
     setBadgeCopied(metric);
     window.setTimeout(() => setBadgeCopied(null), 1800);
   }
@@ -329,21 +342,25 @@ function ReportPage({ owner, repository, sha, design = CANONICAL_DESIGN, preview
     <div className="header-actions"><a href={report.repository.html_url} target="_blank" rel="noreferrer">View on GitHub</a><button className="secondary-button" onClick={() => navigator.clipboard.writeText(window.location.href)}>Copy report link</button></div>
   </section>
   <section className="metrics">
-    <div><span>Full content</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>all recognized tokens</small></div>
-    <div><span>Discovery metadata</span><strong>{number(report.metadata_tokens)}</strong><small>names + descriptions</small></div>
+    <div><span>Full</span><strong>{number(report.category_totals.all_discovered_text)}</strong><small>reasonable upper bound</small></div>
+    <div><span>Expected</span><strong>{number(report.activation_tokens)}</strong><small>practical default profile</small></div>
+    <div><span>Minimal</span><strong>{number(report.metadata_tokens)}</strong><small>names + descriptions</small></div>
     <div><span>Inventory</span><strong>{number(report.inventory.length)}</strong><small>loadable artifacts</small></div>
     <div><span>Relevant files</span><strong>{number(report.scan.relevant_files)}</strong><small>{number(report.scan.relevant_bytes)} bytes</small></div>
     <div><span>Tokenizer</span><strong>{report.method.encoding}</strong><small>tiktoken {report.method.version}</small></div>
   </section>
   <section className="report-badges" aria-label="README badges">
     {(["summary", "metadata", "total"] as BadgeMetric[]).map((metric) => <div className="badge-share" key={metric}>
-      <a className="badge-image-link" href={window.location.href} aria-label={`Open this report from the ${badgeLabel(metric).toLowerCase()} badge`}>
+      <a className="badge-image-link" href={badgeReportUrl()} aria-label={`Open the latest report from the ${badgeLabel(metric).toLowerCase()} badge`}>
         <img src={badgeUrl(metric)} alt={`${badgeLabel(metric)} badge`} />
       </a>
-      <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
+      <div className="badge-actions">
+        <button className="badge-copy" onClick={() => copyBadge(metric)}>{badgeCopied === metric ? "Copied" : "Copy"}</button>
+      </div>
     </div>)}
   </section>
-  <p className="inventory-note">Discovery metadata counts artifact names and descriptions. Full content includes all recognized instructions, supporting text, and canonical tool definitions; it is an inventory, not an estimate of one simultaneously active prompt. Runtime connection configuration and secrets are excluded.</p>
+  <p className="badge-note">Copy follows the branch, tag, or commit supplied for this report; without one, it follows the repository’s default branch.</p>
+  <p className="inventory-note">Minimal is the lower bound used to select artifacts. Expected is a practical default—not a guarantee of any particular harness—and includes skill instructions, MCP input schemas, and complete instruction, agent, rule, or prompt files. Full adds reasonable optional static content such as skill resources and MCP output schemas. These are repository-wide profiles, not estimates of one simultaneously active prompt.</p>
   <section className="report-grid"><div>
     <div className="filters"><input aria-label="Filter paths" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter paths…" /><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">All kinds</option>{kinds.map((value) => <option key={value}>{value}</option>)}</select><select value={harness} onChange={(event) => setHarness(event.target.value)}><option value="all">All harnesses</option>{harnesses.map((value) => <option key={value}>{value}</option>)}</select></div>
     <div className="inventory-list">{filtered.map((item) => <InventoryCard key={item.id} item={item} selected={selected} toggle={toggle} />)}{filtered.length === 0 && <p className="empty">No matching harness artifacts.</p>}</div>
@@ -413,10 +430,11 @@ function LocalResult({ result }: { result: SkillsResponse | McpResponse | Contex
   if (!result) return <div className="empty-state"><h2>No result yet</h2><p>Run an estimate to see its token breakdown.</p></div>;
   if (result.mode === "scenario") return <><div className="native-result"><strong>{number(result.total_tokens)}</strong><span>scenario tokens</span></div>{Object.entries(result.breakdown).map(([key, value]) => <div className="result-line" key={key}><span>{title(key)}</span><b>{number(value)}</b></div>)}</>;
   const total = result.mode === "skills" ? Object.values(result.totals).reduce((a, b) => a + b, 0) : result.mode === "mcp" ? result.totals.definition : result.totals.tokens;
-  return <><div className="native-result"><strong>{number(total)}</strong><span>full {result.mode} content</span></div>{result.records.map((record) => {
+  return <><div className="native-result"><strong>{number(total)}</strong><span>full {result.mode} context</span></div>{result.records.map((record) => {
     const full = "body" in record ? record.metadata + record.body + record.optional : "definition" in record ? record.definition : record.tokens;
     const discovery = "body" in record ? record.metadata : "definition" in record ? record.discovery_tokens : null;
-    return <div className="result-line" key={record.id}><span>{"name" in record ? record.name : record.source}<small>{record.source}{discovery !== null && <> · discovery {number(discovery)}</>}</small></span><b>{number(full)}</b></div>;
+    const activation = "body" in record ? record.metadata + record.body : "definition" in record ? record.activation_tokens : null;
+    return <div className="result-line" key={record.id}><span>{"name" in record ? record.name : record.source}<small>{record.source}{discovery !== null && <> · minimal {number(discovery)} · expected {number(activation)}</>}</small></span><b>{number(full)}</b></div>;
   })}</>;
 }
 

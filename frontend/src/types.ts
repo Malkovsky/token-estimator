@@ -12,7 +12,7 @@ export type InventoryItem = {
   mcp_servers: { name: string; transport: string }[];
   mcp_tool_breakdown: {
     name: number; description: number; discovery: number; input_schema: number;
-    output_schema: number; details: number; definition: number;
+    activation: number; output_schema: number; details: number; definition: number;
   } | null;
   accounting_note: string | null;
 };
@@ -20,7 +20,7 @@ export type RepositoryReport = {
   api_version: "v1"; mode: "repository";
   repository: { provider: "github"; owner: string; name: string; commit_sha: string; html_url: string; subdirectory: string | null };
   method: MethodInfo; analyzer_version: string; inventory: InventoryItem[];
-  metadata_tokens: number;
+  metadata_tokens: number; activation_tokens: number;
   category_totals: Record<string, number>;
   warnings: { code: string; message: string; path: string | null; count: number }[];
   scan: { archive_members: number; relevant_files: number; relevant_bytes: number };
@@ -39,7 +39,8 @@ export type SkillRecord = {
 export type McpRecord = {
   id: string; source: string; name: string; encoding: string;
   name_tokens: number; description: number; discovery_tokens: number;
-  schema_tokens: number; output_schema_tokens: number; details_tokens: number;
+  schema_tokens: number; activation_tokens: number;
+  output_schema_tokens: number; details_tokens: number;
   definition: number;
 };
 export type ContextRecord = {
